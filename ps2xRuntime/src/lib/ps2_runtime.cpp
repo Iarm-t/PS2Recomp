@@ -46,6 +46,7 @@ namespace ps2_host_display
     std::atomic<float> windowAspect{4.0f / 3.0f};
     std::atomic<bool> fitWindow{false};
     bool startMaximized = false;
+    bool headless = false;
 
     void setAspect(float aspect)
     {
@@ -75,6 +76,11 @@ namespace ps2_host_display
     void setStartMaximized(bool enabled)
     {
         startMaximized = enabled;
+    }
+
+    void setHeadless(bool enabled)
+    {
+        headless = enabled;
     }
 }
 
@@ -838,12 +844,21 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN);
+        if (ps2_host_display::headless)
+            SetConfigFlags(FLAG_WINDOW_HIDDEN);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        if (ps2_host_display::startMaximized)
+        if (ps2_host_display::startMaximized && !ps2_host_display::headless)
             MaximizeWindow();
         SetExitKey(KEY_NULL);
-        InitAudioDevice();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        if (ps2_host_display::headless)
+        {
+            m_audioBackend.setAudioReady(false);
+        }
+        else
+        {
+            InitAudioDevice();
+            m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        }
         GSSharedPresent::CaptureHostContext();
 #endif
         const bool coreReady = syncCoreSubsystems();

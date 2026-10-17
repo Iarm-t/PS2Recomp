@@ -6,4 +6,5 @@ namespace ps2_host_display
     float aspect();
     void setFitWindow(bool enabled);
     void setStartMaximized(bool enabled);
+    void setHeadless(bool enabled);
 }

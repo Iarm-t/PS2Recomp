@@ -18,6 +18,7 @@ add_library(ps2_gs_reference STATIC
 target_include_directories(ps2_gs_reference PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}/gs_reference
     ${CMAKE_CURRENT_LIST_DIR}/../ps2xRuntime/include
+    ${CMAKE_CURRENT_LIST_DIR}/../ps2xIOP/include
 )
 
 target_link_libraries(ps2_gs_reference PUBLIC ps2_runtime)

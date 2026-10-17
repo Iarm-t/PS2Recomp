@@ -2301,6 +2301,21 @@ namespace ps2recomp
 
     bool PS2Recompiler::writeToFile(const std::string &path, const std::string &content)
     {
+        std::filesystem::path filePath(path);
+        if (std::filesystem::exists(filePath))
+        {
+            std::ifstream existing(filePath, std::ios::in | std::ios::binary);
+            if (existing)
+            {
+                std::ostringstream existingContent;
+                existingContent << existing.rdbuf();
+                if (existingContent.str() == content)
+                {
+                    return true;
+                }
+            }
+        }
+
         std::ofstream file(path);
         if (!file)
         {
