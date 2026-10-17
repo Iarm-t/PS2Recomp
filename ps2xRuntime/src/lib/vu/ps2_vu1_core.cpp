@@ -77,6 +77,35 @@ namespace
         bool enabled = true;
     };
 
+    VU1InterpreterAccess::CompiledProgram findCompiledVu1ProgramInRegistry(const Vu1CompiledRegistry &registry, const uint8_t *vuCode, uint32_t codeSize)
+    {
+        if (registry.programs.empty() || !vuCode || codeSize == 0u || (codeSize & 7u) != 0u)
+            return nullptr;
+        constexpr uint64_t kPrime = 0x100000001B3ull;
+        const size_t pairs = codeSize / 8u;
+        std::vector<uint64_t> prefixes(pairs);
+        uint64_t hash = 0xCBF29CE484222325ull;
+        for (size_t i = 0; i < pairs; ++i)
+        {
+            for (size_t b = 0; b < 8u; ++b)
+            {
+                hash ^= vuCode[i * 8u + b];
+                hash *= kPrime;
+            }
+            prefixes[i] = hash;
+        }
+        uint64_t zeroPow = 1ull;
+        for (size_t i = pairs; i > 0u; --i)
+        {
+            const auto it = registry.programs.find(prefixes[i - 1u] * zeroPow);
+            if (it != registry.programs.end())
+                return it->second;
+            for (size_t b = 0; b < 8u; ++b)
+                zeroPow *= kPrime;
+        }
+        return nullptr;
+    }
+
     VU1InterpreterAccess::CompiledProgram findCompiledVu1Image(Vu1CompiledRegistry &registry, const uint8_t *vuCode, uint32_t codeSize)
     {
         for (size_t index = 0; index < registry.recent.size(); ++index)
@@ -89,11 +118,10 @@ namespace
                 return registry.recent[0].program;
             }
         }
-        const auto it = registry.programs.find(fnv1a64(vuCode, codeSize));
         Vu1ImageCacheEntry entry;
         entry.image.assign(vuCode, vuCode + codeSize);
-        entry.program = it == registry.programs.end() ? nullptr : it->second;
-        constexpr size_t kRecentImages = 8u;
+        entry.program = findCompiledVu1ProgramInRegistry(registry, vuCode, codeSize);
+        constexpr size_t kRecentImages = 16u;
         if (registry.recent.size() < kRecentImages)
             registry.recent.push_back(std::move(entry));
         else
@@ -1261,6 +1289,11 @@ VU1InterpreterAccess::CompiledProgram findCompiledVu1ProgramByHash(uint64_t imag
     const auto &programs = vu1CompiledRegistry().programs;
     const auto it = programs.find(imageHash);
     return it == programs.end() ? nullptr : it->second;
+}
+
+VU1InterpreterAccess::CompiledProgram findCompiledVu1ProgramByImage(const uint8_t *vuCode, uint32_t codeSize)
+{
+    return findCompiledVu1ProgramInRegistry(vu1CompiledRegistry(), vuCode, codeSize);
 }
 
 void registerVu1CompiledProgram(uint64_t imageHash, VU1InterpreterAccess::CompiledProgram program)

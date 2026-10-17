@@ -3851,3 +3851,4 @@ struct VU1InterpreterAccess
 
 void registerVu1CompiledProgram(uint64_t imageHash, VU1InterpreterAccess::CompiledProgram program);
 VU1InterpreterAccess::CompiledProgram findCompiledVu1ProgramByHash(uint64_t imageHash);
+VU1InterpreterAccess::CompiledProgram findCompiledVu1ProgramByImage(const uint8_t *vuCode, uint32_t codeSize);
