@@ -2015,6 +2015,11 @@ struct GSGpuBackend::Impl
         const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
         if (!sixteenBit && !thirtyTwoBit)
             return;
+        const std::array<uint32_t, 6> key = {isFourBitIndexedPsm(tex0.psm) ? 1u : 0u, tex0.cbp,
+                                             static_cast<uint32_t>(tex0.cpsm) | (static_cast<uint32_t>(tex0.csm) << 8u) | (static_cast<uint32_t>(tex0.csa) << 16u),
+                                             texclut.cbw, texclut.cou, texclut.cov};
+        if (clutKeyValid && key == clutKey && !(clutSourcePages & writePages).any())
+            return;
         std::bitset<kPages> source;
         if (tex0.csm == 0u)
             markPages(source, tex0.cpsm, tex0.cbp, 1u, 0, 0, 15, 15);
@@ -2029,9 +2034,6 @@ struct GSGpuBackend::Impl
             ++stats.flushTexture;
             flushFor(2u);
         }
-        const std::array<uint32_t, 6> key = {isFourBitIndexedPsm(tex0.psm) ? 1u : 0u, tex0.cbp,
-                                             static_cast<uint32_t>(tex0.cpsm) | (static_cast<uint32_t>(tex0.csm) << 8u) | (static_cast<uint32_t>(tex0.csa) << 16u),
-                                             texclut.cbw, texclut.cou, texclut.cov};
         if (clutKeyValid && key == clutKey)
             return;
         clutKey = key;

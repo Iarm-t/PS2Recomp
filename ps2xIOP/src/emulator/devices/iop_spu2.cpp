@@ -78,36 +78,37 @@ namespace ps2x::iop::detail
             return std::clamp(sample, -32768, 32767);
         }
 
-        const std::array<std::array<int16_t, 4>, 256> &interpolationWeights()
+        const auto kInterpolationWeights = []
         {
-            static const auto weights = []
+            std::array<double, 512> kernel{};
+            double total = 0.0;
+            for (size_t index = 0u; index < kernel.size(); ++index)
             {
-                std::array<double, 512> kernel{};
-                double total = 0.0;
-                for (size_t index = 0u; index < kernel.size(); ++index)
-                {
-                    const double position = static_cast<double>(index) + 0.5;
-                    const double window = 1.0 + (std::cos(std::numbers::pi * position / 511.5) - 1.0) * 0.5
-                                              + (std::cos(std::numbers::pi * position / 255.75) - 1.0) * 0.08;
-                    const double value = std::sin(std::numbers::pi * position / 500.0) * window / position;
-                    kernel[511u - index] = value;
-                    total += value;
-                }
-                const double normalization = 32640.0 * 128.0 / total;
-                std::array<std::array<int16_t, 4>, 256> result{};
-                for (size_t phase = 0u; phase < result.size(); ++phase)
-                {
-                    const std::array<size_t, 4> indices{255u - phase, 511u - phase, phase + 256u, phase};
-                    double sum = 0.0;
-                    for (const size_t index : indices)
-                        sum += kernel[index] * normalization;
-                    const double correction = (sum - 32640.0) / 4.0;
-                    for (size_t tap = 0u; tap < indices.size(); ++tap)
-                        result[phase][tap] = static_cast<int16_t>(std::lround(kernel[indices[tap]] * normalization - correction));
-                }
-                return result;
-            }();
-            return weights;
+                const double position = static_cast<double>(index) + 0.5;
+                const double window = 1.0 + (std::cos(std::numbers::pi * position / 511.5) - 1.0) * 0.5
+                                          + (std::cos(std::numbers::pi * position / 255.75) - 1.0) * 0.08;
+                const double value = std::sin(std::numbers::pi * position / 500.0) * window / position;
+                kernel[511u - index] = value;
+                total += value;
+            }
+            const double normalization = 32640.0 * 128.0 / total;
+            std::array<std::array<int16_t, 4>, 256> result{};
+            for (size_t phase = 0u; phase < result.size(); ++phase)
+            {
+                const std::array<size_t, 4> indices{255u - phase, 511u - phase, phase + 256u, phase};
+                double sum = 0.0;
+                for (const size_t index : indices)
+                    sum += kernel[index] * normalization;
+                const double correction = (sum - 32640.0) / 4.0;
+                for (size_t tap = 0u; tap < indices.size(); ++tap)
+                    result[phase][tap] = static_cast<int16_t>(std::lround(kernel[indices[tap]] * normalization - correction));
+            }
+            return result;
+        }();
+
+        inline const std::array<std::array<int16_t, 4>, 256> &interpolationWeights()
+        {
+            return kInterpolationWeights;
         }
     }
 
@@ -406,10 +407,12 @@ namespace ps2x::iop::detail
         const int32_t pitch = std::min<int32_t>(reg(params + kParamPitch * 2u), kMaxPitch);
         if (voice.phase == kPhaseOff && pitch == 0)
             return 0;
-        const uint16_t adsr1 = reg(params + kParamAdsr1 * 2u);
-        const uint16_t adsr2 = reg(params + kParamAdsr2 * 2u);
         if (voice.phase != kPhaseOff)
+        {
+            const uint16_t adsr1 = reg(params + kParamAdsr1 * 2u);
+            const uint16_t adsr2 = reg(params + kParamAdsr2 * 2u);
             stepEnvelope(voice, adsr1, adsr2);
+        }
         voice.counter += pitch;
         while (voice.counter > 0)
         {
@@ -437,18 +440,27 @@ namespace ps2x::iop::detail
         const int32_t c1 = predictor < first.size() ? first[predictor] : 0;
         const int32_t c2 = predictor < second.size() ? second[predictor] : 0;
         const uint32_t shift = header & 0xFu;
-        for (uint32_t sample = 0u; sample < kSamplesPerBlock; ++sample)
+        int32_t h1 = decoder.history1;
+        int32_t h2 = decoder.history2;
+        uint32_t sample = 0u;
+        for (uint32_t word = 0u; word < 7u; ++word)
         {
-            const uint16_t packed = m_ram[(address + 1u + sample / 4u) & kAddressMask];
-            const int32_t nibble = (packed >> ((sample % 4u) * 4u)) & 0xFu;
-            const int32_t signedNibble = nibble >= 8 ? nibble - 16 : nibble;
-            const int32_t raw = (signedNibble * 4096) >> shift;
-            const int32_t filtered = raw + ((decoder.history1 * c1 + decoder.history2 * c2 + 32) >> 6);
-            const int32_t decoded = saturate(filtered);
-            decoder.pcm[sample] = static_cast<int16_t>(decoded);
-            decoder.history2 = decoder.history1;
-            decoder.history1 = decoded;
+            uint32_t packed = m_ram[(address + 1u + word) & kAddressMask];
+            for (uint32_t sub = 0u; sub < 4u; ++sub)
+            {
+                const int32_t nibble = static_cast<int32_t>(packed & 0xFu);
+                packed >>= 4u;
+                const int32_t signedNibble = nibble >= 8 ? nibble - 16 : nibble;
+                const int32_t raw = (signedNibble * 4096) >> shift;
+                const int32_t filtered = raw + ((h1 * c1 + h2 * c2 + 32) >> 6);
+                const int32_t decoded = saturate(filtered);
+                decoder.pcm[sample++] = static_cast<int16_t>(decoded);
+                h2 = h1;
+                h1 = decoded;
+            }
         }
+        decoder.history1 = h1;
+        decoder.history2 = h2;
     }
 
     void IopSpu2::stepAddress(uint32_t core, uint32_t index)

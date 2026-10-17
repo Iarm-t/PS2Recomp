@@ -25,32 +25,31 @@ namespace
         std::string vramPath;
     };
 
-    GsTraceConfig &gsTrace()
+    GsTraceConfig g_gsTrace = []
     {
-        static GsTraceConfig config = []
+        GsTraceConfig result;
+        const char *value = std::getenv("PS2X_GS_TRACE");
+        unsigned long long first = 0;
+        unsigned long long count = 0;
+        char path[512]{};
+        if (value && std::sscanf(value, "%llu:%llu:%511[^\n]", &first, &count, path) == 3)
         {
-            GsTraceConfig result;
-            const char *value = std::getenv("PS2X_GS_TRACE");
-            unsigned long long first = 0;
-            unsigned long long count = 0;
-            char path[512]{};
-            if (value && std::sscanf(value, "%llu:%llu:%511[^\n]", &first, &count, path) == 3)
-            {
-                result.firstTick = first;
-                result.endTick = first + count;
-                result.file = std::fopen(path, "w");
-                result.vramPath = std::string(path) + ".vram";
-            }
-            return result;
-        }();
-        return config;
+            result.firstTick = first;
+            result.endTick = first + count;
+            result.file = std::fopen(path, "w");
+            result.vramPath = std::string(path) + ".vram";
+        }
+        return result;
+    }();
+
+    inline GsTraceConfig &gsTrace() noexcept
+    {
+        return g_gsTrace;
     }
 
-    std::FILE *gsTraceFile(const GSRegisters *regs, const uint8_t *vram = nullptr, uint32_t vramSize = 0u)
+    std::FILE *gsTraceFileSlow(const GSRegisters *regs, const uint8_t *vram, uint32_t vramSize)
     {
-        GsTraceConfig &config = gsTrace();
-        if (!config.file || !regs)
-            return nullptr;
+        GsTraceConfig &config = g_gsTrace;
         const uint64_t tick = regs->vsyncTick.load(std::memory_order_acquire);
         if (tick < config.firstTick)
             return nullptr;
@@ -83,6 +82,13 @@ namespace
                          static_cast<unsigned long long>(regs->bgcolor));
         }
         return config.file;
+    }
+
+    inline std::FILE *gsTraceFile(const GSRegisters *regs, const uint8_t *vram = nullptr, uint32_t vramSize = 0u) noexcept
+    {
+        if (!g_gsTrace.file || !regs)
+            return nullptr;
+        return gsTraceFileSlow(regs, vram, vramSize);
     }
 
     void traceDraw(std::FILE *file, const GSPrimitiveBatch &batch)
@@ -287,6 +293,12 @@ void GS::reset()
         m_hasHostPresentationFrame = false;
     }
 
+    static const bool s_defaultDebugHistoryPaused = []
+    {
+        const char *env = std::getenv("PS2X_GS_DEBUG_HISTORY");
+        return !(env && *env && std::strcmp(env, "0") != 0);
+    }();
+    m_debugHistoryPaused = s_defaultDebugHistoryPaused;
     m_debugHistoryWrite = 0;
     m_debugHistoryCount = 0;
     m_debugNextSeq = 1;
@@ -1349,7 +1361,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        m_backend->LoadClut(t, m_texclut);
+        if (t.cld != 0u)
+            m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1380,7 +1393,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        m_backend->LoadClut(t, m_texclut);
+        if (t.cld != 0u)
+            m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_XYOFFSET_1:

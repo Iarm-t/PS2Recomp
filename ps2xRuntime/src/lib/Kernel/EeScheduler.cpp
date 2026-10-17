@@ -192,6 +192,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_enabledIntcMask = 0xFFFFFFFFu;
     m_enabledDmacMask = 0xFFFFFFFFu;
     m_currentThreadId = 0;
+    m_currentThread = nullptr;
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
@@ -692,6 +693,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     const uint32_t ownedStack = deleteThreadRecord && exiting->ownsStack ? exiting->stack : 0u;
     makeDormant(*exiting);
     m_currentThreadId = 0;
+    m_currentThread = nullptr;
     if (deleteThreadRecord && id != kMainThreadId)
     {
         m_threads.erase(id);
@@ -1677,12 +1679,28 @@ const EeEventFlag *EeScheduler::eventFlag(int id) const
 
 GuestThread *EeScheduler::currentThread()
 {
-    return thread(m_currentThreadId);
+    if (m_currentThreadId == 0)
+    {
+        m_currentThread = nullptr;
+        return nullptr;
+    }
+    if (m_currentThread && m_currentThread->id == m_currentThreadId)
+        return m_currentThread;
+    m_currentThread = thread(m_currentThreadId);
+    return m_currentThread;
 }
 
 const GuestThread *EeScheduler::currentThread() const
 {
-    return thread(m_currentThreadId);
+    if (m_currentThreadId == 0)
+    {
+        m_currentThread = nullptr;
+        return nullptr;
+    }
+    if (m_currentThread && m_currentThread->id == m_currentThreadId)
+        return m_currentThread;
+    m_currentThread = const_cast<GuestThread *>(thread(m_currentThreadId));
+    return m_currentThread;
 }
 
 int EeScheduler::currentThreadId() const noexcept
@@ -1888,6 +1906,7 @@ void EeScheduler::makeRunning(GuestThread &item)
     assert(item.status == EeThreadStatus::Ready);
     item.status = EeThreadStatus::Running;
     m_currentThreadId = item.id;
+    m_currentThread = &item;
     renewTimeSlice();
     traceScheduler(m_vsyncTick, m_eeCycle, "S %d pc=%x", item.id, item.activeContext().pc);
 }

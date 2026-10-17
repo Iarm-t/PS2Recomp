@@ -44,20 +44,21 @@ namespace
         uint64_t calls = 0;
     };
 
-    Vu1ProgramCapture *vu1ProgramCapture()
+    Vu1ProgramCapture *const g_vu1ProgramCapture = []() -> Vu1ProgramCapture *
     {
-        static Vu1ProgramCapture *capture = []() -> Vu1ProgramCapture *
-        {
-            const char *value = std::getenv("PS2X_VU1_CAPTURE");
-            if (!value || !*value)
-                return nullptr;
-            auto *result = new Vu1ProgramCapture();
-            result->directory = value;
-            std::error_code error;
-            std::filesystem::create_directories(result->directory, error);
-            return result;
-        }();
-        return capture;
+        const char *value = std::getenv("PS2X_VU1_CAPTURE");
+        if (!value || !*value)
+            return nullptr;
+        auto *result = new Vu1ProgramCapture();
+        result->directory = value;
+        std::error_code error;
+        std::filesystem::create_directories(result->directory, error);
+        return result;
+    }();
+
+    inline Vu1ProgramCapture *vu1ProgramCapture()
+    {
+        return g_vu1ProgramCapture;
     }
 
     struct Vu1ImageCacheEntry
@@ -144,38 +145,39 @@ namespace
         uint64_t skipped = 0;
     };
 
-    Vu1Trace *vu1Trace()
+    Vu1Trace *const g_vu1Trace = []() -> Vu1Trace *
     {
-        static Vu1Trace *trace = []() -> Vu1Trace *
+        const char *value = std::getenv("PS2X_VU1_TRACE");
+        if (!value || !*value)
+            return nullptr;
+        std::string spec(value);
+        const size_t second = spec.rfind(':');
+        const size_t first = second == std::string::npos || second == 0u ? std::string::npos : spec.rfind(':', second - 1u);
+        if (first == std::string::npos || first < 2u)
+            return nullptr;
+        auto *result = new Vu1Trace();
+        const std::filesystem::path path = spec.substr(0, first);
+        result->first = std::stoull(spec.substr(first + 1u, second - first - 1u));
+        result->last = result->first + std::stoull(spec.substr(second + 1u));
+        result->directory = path.parent_path();
+        result->file = std::fopen(path.string().c_str(), "wb");
+        if (!result->file)
         {
-            const char *value = std::getenv("PS2X_VU1_TRACE");
-            if (!value || !*value)
-                return nullptr;
-            std::string spec(value);
-            const size_t second = spec.rfind(':');
-            const size_t first = second == std::string::npos || second == 0u ? std::string::npos : spec.rfind(':', second - 1u);
-            if (first == std::string::npos || first < 2u)
-                return nullptr;
-            auto *result = new Vu1Trace();
-            const std::filesystem::path path = spec.substr(0, first);
-            result->first = std::stoull(spec.substr(first + 1u, second - first - 1u));
-            result->last = result->first + std::stoull(spec.substr(second + 1u));
-            result->directory = path.parent_path();
-            result->file = std::fopen(path.string().c_str(), "wb");
-            if (!result->file)
-            {
-                delete result;
-                return nullptr;
-            }
-            return result;
-        }();
-        return trace;
+            delete result;
+            return nullptr;
+        }
+        return result;
+    }();
+
+    inline Vu1Trace *vu1Trace()
+    {
+        return g_vu1Trace;
     }
 
     void traceVu1Run(VU1Interpreter &vu, const uint8_t *vuCode, uint32_t codeSize, const uint8_t *vuData, uint32_t dataSize,
                      PS2Memory *memory, uint32_t maxCycles)
     {
-        Vu1Trace *trace = vu1Trace();
+        Vu1Trace *trace = g_vu1Trace;
         if (!trace || !memory || dataSize != 0x4000u || codeSize != 0x4000u)
             return;
         const uint64_t tick = memory->gs().vsyncTick.load();
@@ -247,14 +249,15 @@ namespace
         ++trace->records;
     }
 
-    bool vu1VerifyEnabled()
+    const bool g_vu1VerifyEnabled = []
     {
-        static const bool enabled = []
-        {
-            const char *value = std::getenv("PS2X_VU1_VERIFY");
-            return value && *value && std::strcmp(value, "0") != 0;
-        }();
-        return enabled;
+        const char *value = std::getenv("PS2X_VU1_VERIFY");
+        return value && *value && std::strcmp(value, "0") != 0;
+    }();
+
+    inline bool vu1VerifyEnabled()
+    {
+        return g_vu1VerifyEnabled;
     }
 
     Vu1CompiledRegistry &vu1CompiledRegistry()
@@ -287,7 +290,7 @@ namespace
 
     void captureVu1Program(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint32_t pc)
     {
-        Vu1ProgramCapture *capture = vu1ProgramCapture();
+        Vu1ProgramCapture *capture = g_vu1ProgramCapture;
         if (!capture || !memory)
             return;
         const uint64_t generation = memory->getVU1CodeGeneration();
@@ -373,27 +376,39 @@ VU1Interpreter::VU1Interpreter(Unit unit)
 
 void VU1Interpreter::resetScheduler()
 {
-    std::memset(m_flagPipeline.data(), 0, sizeof(m_flagPipeline));
-    std::memset(&m_fdiv, 0, sizeof(m_fdiv));
-    std::memset(m_efu.data(), 0, sizeof(m_efu));
-    std::memset(m_storePipeline.data(), 0, sizeof(m_storePipeline));
-    std::memset(m_vfWritePipeline.data(), 0, sizeof(m_vfWritePipeline));
-    std::memset(m_viWritePipeline.data(), 0, sizeof(m_viWritePipeline));
-    std::memset(m_accWritePipeline.data(), 0, sizeof(m_accWritePipeline));
-    m_flagValid = 0u;
-    m_storeValid = 0u;
-    m_vfWriteValid = 0u;
-    m_viWriteValid = 0u;
-    m_accWriteValid = 0u;
+    if (m_flagValid != 0u)
+    {
+        std::memset(m_flagPipeline.data(), 0, sizeof(m_flagPipeline));
+        m_flagValid = 0u;
+    }
+    m_fdiv = {};
+    m_efu = {};
+    if (m_storeValid != 0u)
+    {
+        std::memset(m_storePipeline.data(), 0, sizeof(m_storePipeline));
+        m_storeValid = 0u;
+    }
+    if ((m_vfWriteValid | m_viWriteValid | m_accWriteValid) != 0u)
+    {
+        if (m_vfWriteValid != 0u)
+            std::memset(m_vfWritePipeline.data(), 0, sizeof(m_vfWritePipeline));
+        if (m_viWriteValid != 0u)
+            std::memset(m_viWritePipeline.data(), 0, sizeof(m_viWritePipeline));
+        if (m_accWriteValid != 0u)
+            std::memset(m_accWritePipeline.data(), 0, sizeof(m_accWritePipeline));
+        m_vfWriteValid = 0u;
+        m_viWriteValid = 0u;
+        m_accWriteValid = 0u;
+        std::memset(m_vfLatestWrite.data(), 0, sizeof(m_vfLatestWrite));
+        std::memset(m_viLatestWrite.data(), 0, sizeof(m_viLatestWrite));
+        std::memset(m_accLatestWrite.data(), 0, sizeof(m_accLatestWrite));
+        m_nextWriteSequence = 0;
+    }
     m_nextCommitCycle = std::numeric_limits<uint64_t>::max();
     resetXgkick();
     std::memset(m_vfReady.data(), 0, sizeof(m_vfReady));
     std::memset(m_viReady.data(), 0, sizeof(m_viReady));
     std::memset(m_accReady.data(), 0, sizeof(m_accReady));
-    std::memset(m_vfLatestWrite.data(), 0, sizeof(m_vfLatestWrite));
-    std::memset(m_viLatestWrite.data(), 0, sizeof(m_viLatestWrite));
-    std::memset(m_accLatestWrite.data(), 0, sizeof(m_accLatestWrite));
-    m_nextWriteSequence = 0;
     m_efuResourceReady = 0;
     m_workingClip = m_state.clip;
     m_viBranchBackupValue = 0;

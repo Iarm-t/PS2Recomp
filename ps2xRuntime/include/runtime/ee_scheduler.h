@@ -491,6 +491,7 @@ private:
     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
     int m_currentThreadId = 0;
+    mutable GuestThread *m_currentThread = nullptr;
     bool m_rescheduleRequested = false;
     bool m_unwinding = false;
     bool m_sharedVu0RandomValid = false;

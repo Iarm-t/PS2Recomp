@@ -180,7 +180,19 @@ namespace
         return value ? static_cast<size_t>(std::strtoul(value, nullptr, 10)) : 0u;
     }();
 
-    BranchTrace *branchTrace()
+    const bool g_dispatchHistoryEnabled = []() -> bool
+    {
+        const char *value = std::getenv("PS2X_DISPATCH_HISTORY");
+        return g_branchTraceSize != 0u || (value && *value && std::string_view(value) != "0");
+    }();
+
+    const bool g_singleLookup = []() -> bool
+    {
+        const char *setting = std::getenv("PS2X_EE_SINGLE_LOOKUP");
+        return !setting || std::string_view(setting) != "0";
+    }();
+
+    BranchTrace *branchTraceSlow()
     {
         const size_t size = g_branchTraceSize;
         if (size == 0u)
@@ -195,9 +207,22 @@ namespace
         return &trace;
     }
 
-    void pushBranchEvent(uint32_t kind, uint32_t source, uint32_t target, R5900Context *ctx, uint32_t extra)
+    inline BranchTrace *branchTrace()
     {
-        BranchTrace *trace = branchTrace();
+        if (g_branchTraceSize == 0u)
+        {
+            return nullptr;
+        }
+        return branchTraceSlow();
+    }
+
+    inline void pushBranchEvent(uint32_t kind, uint32_t source, uint32_t target, R5900Context *ctx, uint32_t extra)
+    {
+        if (g_branchTraceSize == 0u)
+        {
+            return;
+        }
+        BranchTrace *trace = branchTraceSlow();
         if (!trace)
         {
             return;
@@ -276,8 +301,12 @@ namespace
         return true;
     }
 
-    void pushDispatchPc(uint32_t pc)
+    inline void pushDispatchPc(uint32_t pc)
     {
+        if (!g_dispatchHistoryEnabled)
+        {
+            return;
+        }
         DispatchHistory &h = g_dispatchHistory;
         h.pcs[h.next] = pc;
         h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
@@ -1519,12 +1548,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    static const bool singleLookup = [] {
-        const char *setting = std::getenv("PS2X_EE_SINGLE_LOOKUP");
-        return !setting || std::string_view(setting) != "0";
-    }();
     RecompiledFunction targetFn = nullptr;
-    if (singleLookup)
+    if (g_singleLookup)
     {
         uint32_t slot = 0u;
         if (generatedFunctionTableSlot(targetPc, slot))
@@ -1547,14 +1572,13 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (policy == MissingFunctionPolicy::ContinueToTarget)
         {
             ctx->pc = targetPc;
-            // if you need the app to keep open to open debug pannel change this to false
             return false;
         }
 
         return false;
     }
 
-    if (singleLookup)
+    if (g_singleLookup)
         pushDispatchPc(targetPc);
     const uint32_t entryPc = ctx->pc;
     const uint64_t jumpSerial = g_guestJumpSerial;

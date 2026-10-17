@@ -1073,7 +1073,8 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     else if (physAddr < PS2_RAM_SIZE)
     {
         // Check if this might be code modification
-        markModified(address, 4);
+        if (!m_codeRegions.empty())
+            markModified(address, 4);
 
         storeScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write32 rdram", address);
     }
@@ -1130,7 +1131,8 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(address, 8);
+        if (!m_codeRegions.empty())
+            markModified(address, 8);
         storeScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write64 rdram", address);
     }
     else
@@ -1194,7 +1196,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(address, 16);
+        if (!m_codeRegions.empty())
+            markModified(address, 16);
         inRange(physAddr, sizeof(__m128i), PS2_RAM_SIZE, "write128 rdram", address);
         _mm_storeu_si128(reinterpret_cast<__m128i *>(&m_rdram[physAddr]), value);
     }

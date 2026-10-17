@@ -57,7 +57,7 @@ namespace ps2x::asyncvif
             std::thread thread;
         };
 
-        constexpr size_t kGifChunkBytes = 256u * 1024u;
+        constexpr size_t kGifChunkBytes = 32u * 1024u;
 
         void publishGif(GifStage &stage)
         {
@@ -130,31 +130,37 @@ namespace ps2x::asyncvif
             for (;;)
             {
                 GifChunk chunk;
+                bool wasFull = false;
                 {
                     std::unique_lock<std::mutex> lock(stage.mutex);
                     stage.workCv.wait(lock, [&]
                                       { return stage.stop || !stage.chunks.empty(); });
                     if (stage.stop && stage.chunks.empty())
                         return;
+                    wasFull = stage.queuedBytes >= kMaxQueuedGifBytes;
                     chunk = std::move(stage.chunks.front());
                     stage.chunks.pop_front();
                     stage.queuedBytes -= chunk.data.size();
                     stage.busy = true;
                 }
-                stage.idleCv.notify_all();
+                if (wasFull)
+                    stage.idleCv.notify_all();
                 for (const GifPacketRef &packet : chunk.packets)
                 {
                     _mm_setcsr(packet.mxcsr);
                     if (s_gifProcessor)
                         s_gifProcessor(chunk.data.data() + packet.offset, packet.size);
                 }
+                bool isIdle = false;
                 {
                     std::lock_guard<std::mutex> lock(stage.mutex);
-                    if (stage.spare.size() < 8u)
+                    if (stage.spare.size() < 16u)
                         stage.spare.push_back(std::move(chunk));
                     stage.busy = false;
+                    isIdle = stage.chunks.empty();
                 }
-                stage.idleCv.notify_all();
+                if (isIdle)
+                    stage.idleCv.notify_all();
             }
         }
 
@@ -173,17 +179,20 @@ namespace ps2x::asyncvif
             for (;;)
             {
                 Job job;
+                bool wasFull = false;
                 {
                     std::unique_lock<std::mutex> lock(worker.mutex);
                     worker.workCv.wait(lock, [&]
                                        { return worker.stop || !worker.jobs.empty(); });
                     if (worker.stop && worker.jobs.empty())
                         return;
+                    wasFull = worker.jobs.size() >= kMaxQueuedJobs;
                     job = std::move(worker.jobs.front());
                     worker.jobs.pop_front();
                     worker.busy = true;
                 }
-                worker.idleCv.notify_all();
+                if (wasFull)
+                    worker.idleCv.notify_all();
                 const Clock::time_point jobStart = Clock::now();
                 _mm_setcsr(job.mxcsr);
                 t_fbrst = job.fbrst;
@@ -223,6 +232,7 @@ namespace ps2x::asyncvif
                         windowCycles = cycles;
                     }
                 }
+                bool isIdle = false;
                 {
                     std::lock_guard<std::mutex> lock(worker.mutex);
                     for (Item &item : job.items)
@@ -234,8 +244,10 @@ namespace ps2x::asyncvif
                         }
                     }
                     worker.busy = false;
+                    isIdle = worker.jobs.empty();
                 }
-                worker.idleCv.notify_all();
+                if (isIdle)
+                    worker.idleCv.notify_all();
             }
         }
     }

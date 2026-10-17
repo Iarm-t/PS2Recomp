@@ -132,14 +132,15 @@ namespace
         }
     }
 
-    bool simdUnpackEnabled()
+    const bool g_simdUnpackEnabled = []
     {
-        static const bool enabled = []
-        {
-            const char *value = std::getenv("PS2X_VIF_SIMD_UNPACK");
-            return !value || *value != '0';
-        }();
-        return enabled;
+        const char *value = std::getenv("PS2X_VIF_SIMD_UNPACK");
+        return !value || *value != '0';
+    }();
+
+    inline bool simdUnpackEnabled()
+    {
+        return g_simdUnpackEnabled;
     }
 
     template <uint32_t Vl, uint32_t Components, bool ZeroExtend, uint32_t Mode>
@@ -163,18 +164,46 @@ namespace
             {
                 if constexpr (Components == 4u)
                     value = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source));
-                else
+                else if constexpr (Components == 1u)
                 {
-                    alignas(16) uint32_t lanes[4]{};
-                    std::memcpy(lanes, source, bytes);
-                    value = _mm_load_si128(reinterpret_cast<const __m128i *>(lanes));
+                    int32_t v = 0;
+                    std::memcpy(&v, source, sizeof(v));
+                    value = _mm_cvtsi32_si128(v);
                 }
+                else if constexpr (Components == 2u)
+                    value = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(source));
+                else
+                    value = _mm_castps_si128(_mm_movelh_ps(_mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(source))), _mm_load_ss(reinterpret_cast<const float *>(source + 8u))));
             }
             else
             {
-                uint64_t packed = 0u;
-                std::memcpy(&packed, source, bytes);
-                const __m128i raw = _mm_cvtsi64_si128(static_cast<int64_t>(packed));
+                __m128i raw;
+                if constexpr (bytes == 1u)
+                    raw = _mm_cvtsi32_si128(static_cast<int32_t>(source[0]));
+                else if constexpr (bytes == 2u)
+                {
+                    uint16_t v = 0u;
+                    std::memcpy(&v, source, sizeof(v));
+                    raw = _mm_cvtsi32_si128(static_cast<int32_t>(v));
+                }
+                else if constexpr (bytes == 3u)
+                    raw = _mm_cvtsi32_si128(static_cast<int32_t>(static_cast<uint32_t>(source[0]) | (static_cast<uint32_t>(source[1]) << 8u) | (static_cast<uint32_t>(source[2]) << 16u)));
+                else if constexpr (bytes == 4u)
+                {
+                    int32_t v = 0;
+                    std::memcpy(&v, source, sizeof(v));
+                    raw = _mm_cvtsi32_si128(v);
+                }
+                else if constexpr (bytes == 6u)
+                {
+                    uint32_t lo = 0u;
+                    uint16_t hi = 0u;
+                    std::memcpy(&lo, source, sizeof(lo));
+                    std::memcpy(&hi, source + 4u, sizeof(hi));
+                    raw = _mm_cvtsi64_si128(static_cast<int64_t>(static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u)));
+                }
+                else
+                    raw = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(source));
                 if constexpr (Vl == 1u)
                     value = ZeroExtend ? _mm_cvtepu16_epi32(raw) : _mm_cvtepi16_epi32(raw);
                 else

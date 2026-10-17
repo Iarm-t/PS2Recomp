@@ -532,6 +532,7 @@ void EeScheduler::serializeMachine(Ar &ar)
                 item.tlsBase = 0;
         }
         m_unwinding = false;
+        m_currentThread = nullptr;
         m_insideInterrupt = false;
         m_deferTransfers = false;
         m_transferPending = false;
