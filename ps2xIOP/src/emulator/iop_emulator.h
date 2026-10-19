@@ -2,6 +2,7 @@
 
 #include "ps2x/iop/iop_host.h"
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/state_io.h"
 
 #include <cstdint>
 #include <memory>
@@ -25,6 +26,7 @@ namespace ps2x::iop::detail
         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
         void runEeCycles(uint64_t eeCycles) noexcept;
+        [[nodiscard]] uint64_t eeCyclesUntilBatch() const noexcept;
         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
         void onSifTransfer(const SifTransfer &transfer);
@@ -40,7 +42,11 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint64_t instructions() const noexcept;
         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
         [[nodiscard]] uint32_t threadCount() const noexcept;
+        [[nodiscard]] std::vector<std::string> describeThreads() const;
         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
+
+        void saveState(ps2x::state::Writer &out);
+        void loadState(ps2x::state::Reader &in);
 
     private:
         class Impl;

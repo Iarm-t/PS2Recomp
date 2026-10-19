@@ -1,5 +1,7 @@
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
+#include "devices/iop_sio2.h"
+#include "devices/iop_spu2.h"
 #include "core/iop_cpu.h"
 #include "imports/iop_heaplib.h"
 #include "imports/iop_imports.h"
@@ -37,6 +39,10 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
+        constexpr uint64_t kSifDmaBaseCycles = 64u;
+        constexpr uint64_t kSifDmaBytesPerCycle = 4u;
+        constexpr uint64_t kIopBatchCycles = 1024u;
+        constexpr uint64_t kServerCallMaxCycles = kIopClockHz * 2u;
 
         uint32_t physicalAddress(uint32_t address)
         {
@@ -78,6 +84,12 @@ namespace ps2x::iop::detail
             uint32_t entry = 0;
             uint32_t gp = 0;
             bool resident = false;
+
+            template <typename Ar>
+            void serialize(Ar &ar)
+            {
+                ps2x::state::fields(ar, id, path, name, base, size, entry, gp, resident);
+            }
         };
 
         struct GuestCallback
@@ -106,6 +118,7 @@ namespace ps2x::iop::detail
               intrman(memory),
               timrman(),
               ioman(memory),
+              sio2(host, memory),
               cpuCore(memory),
               imports(memory),
               loadcore(memory, imports)
@@ -124,6 +137,12 @@ namespace ps2x::iop::detail
             intrman.reset();
             timrman.reset();
             ioman.reset();
+            sio2.reset();
+            memory.attachSio2(&sio2);
+            spu2.reset();
+            spu2.setAudioSink([this](std::span<const int16_t> samples) { host.submitAudio(samples); });
+            host.resetAudio();
+            memory.attachSpu2(&spu2, &totalCycles);
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
@@ -131,6 +150,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            eeSyncCycle = 0;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -304,6 +324,9 @@ namespace ps2x::iop::detail
                     secrMcDevIdHandler = {a0, cpu.gpr[28]};
                     setV0(0);
                     return ImportDisposition::Handled;
+                case 6:
+                    setV0(1);
+                    return ImportDisposition::Handled;
                 default:
                     break;
                 }
@@ -318,9 +341,15 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sifman"))
             {
-                return rpc.dispatchSifManImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
+                if (!rpc.dispatchSifManImport(call.ordinal, cpu))
+                    return ImportDisposition::Missing;
+                if (const auto callback = rpc.takeDmaCallback())
+                {
+                    pendingGuestCallbacks.emplace(
+                        totalCycles + kSifDmaBaseCycles + callback->bytes / kSifDmaBytesPerCycle,
+                        ScheduledGuestCallback{callback->function, callback->gp, callback->argument});
+                }
+                return ImportDisposition::Handled;
             }
             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
                 return ImportDisposition::Handled;
@@ -328,7 +357,19 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "dmacman"))
             {
-                setV0(0);
+                switch (call.ordinal)
+                {
+                case 28:
+                    setV0(sio2.dmaRequest(a0, cpu.gpr[5], cpu.gpr[6], cpu.gpr[7], memory.read32(cpu.gpr[29] + 16u)) ? 1u : 0u);
+                    break;
+                case 32:
+                    (void)sio2.dmaTransfer(a0);
+                    setV0(0);
+                    break;
+                default:
+                    setV0(0);
+                    break;
+                }
                 return ImportDisposition::Handled;
             }
             if (iequals(call.library, "stdio") && stdio.dispatchImport(call.ordinal, cpu))
@@ -438,25 +479,19 @@ namespace ps2x::iop::detail
             cpu.gpr[6] = a2;
             cpu.gpr[7] = a3;
             cpu.gpr[28] = gp;
-            if (depth < kCallStackCapacity)
-            {
-                const uint32_t stackTop = kCallStackLimit - depth * kCallStackSize;
-                cpu.gpr[29] = stackTop - 32u;
-            }
-            else if (activeCpu && activeCpu->gpr[29] > kCallStackBase + kStackGuardBytes)
-            {
-                // Extremely deep re-entrancy borrows unused space below the
-                // suspended caller's live frame. Stack growth remains away
-                // from the caller, so its saved registers stay intact.
-                cpu.gpr[29] = (activeCpu->gpr[29] - kStackGuardBytes) & ~15u;
-            }
-            else
-            {
-                cpu.gpr[29] = kCallStackBase - 32u;
-            }
+            cpu.gpr[29] = callStackPointer(depth);
             cpu.gpr[31] = kCallReturnSentinel;
             runCpu(cpu, budget);
             return cpu.gpr[2];
+        }
+
+        uint32_t callStackPointer(uint32_t depth) const
+        {
+            if (depth < kCallStackCapacity)
+                return kCallStackLimit - depth * kCallStackSize - 32u;
+            if (activeCpu && activeCpu->gpr[29] > kCallStackBase + kStackGuardBytes)
+                return (activeCpu->gpr[29] - kStackGuardBytes) & ~15u;
+            return kCallStackBase - 32u;
         }
 
         uint32_t executeGuestFunction(uint32_t address,
@@ -467,6 +502,73 @@ namespace ps2x::iop::detail
                                       uint32_t gp) override
         {
             return callFunction(address, a0, a1, a2, a3, gp);
+        }
+
+        uint32_t executeServerFunction(uint32_t address,
+                                       uint32_t a0,
+                                       uint32_t a1,
+                                       uint32_t a2,
+                                       uint32_t a3,
+                                       uint32_t gp,
+                                       uint32_t priority) override
+        {
+            struct CallDepthGuard
+            {
+                uint32_t &depth;
+                ~CallDepthGuard() { --depth; }
+            };
+
+            const uint32_t depth = callDepth++;
+            const CallDepthGuard depthGuard{callDepth};
+            CpuState cpu{};
+            cpu.pc = address;
+            cpu.gpr[4] = a0;
+            cpu.gpr[5] = a1;
+            cpu.gpr[6] = a2;
+            cpu.gpr[7] = a3;
+            cpu.gpr[28] = gp;
+            cpu.gpr[29] = callStackPointer(depth);
+            cpu.gpr[31] = kCallReturnSentinel;
+
+            IopThread *const previous = kernel.currentThread();
+            const int id = kernel.createCallThread(cpu, priority);
+            IopThread *thread = kernel.beginThread(id);
+            uint32_t executed = 0u;
+            bool blocked = false;
+            while (executed < kMaxCallInstructions)
+            {
+                executed += runCpu(thread->cpu, kMaxCallInstructions - executed);
+                if (thread->cpu.stopped || !thread->cpu.yielded)
+                    break;
+                if (thread->state != IopThreadState::Running)
+                {
+                    blocked = true;
+                    break;
+                }
+                thread->cpu.yielded = false;
+            }
+            kernel.setCurrentThread(previous);
+
+            if (blocked)
+            {
+                const uint64_t deadline = totalCycles + kServerCallMaxCycles;
+                while (!kernel.threadFinished(id) && totalCycles < deadline)
+                    runCycles(kDefaultSlice);
+                kernel.setCurrentThread(previous);
+                if (!kernel.threadFinished(id))
+                {
+                    std::ostringstream out;
+                    out << "[IOP] RPC server 0x" << std::hex << address << " still blocked after "
+                        << std::dec << kServerCallMaxCycles << " cycles";
+                    log(LogLevel::Warning, out.str());
+                }
+            }
+
+            thread = kernel.findThread(id);
+            const uint32_t result = thread ? thread->cpu.gpr[2] : 0u;
+            if (thread && (thread->cpu.stopped || kernel.threadFinished(id)))
+                kernel.releaseThread(id);
+            return result;
         }
 
         uint32_t executeGuestFunctionWithBudget(uint32_t address,
@@ -581,11 +683,30 @@ namespace ps2x::iop::detail
                     if (totalCycles == before)
                         ++totalCycles;
                 }
+                spu2.advanceTo(totalCycles);
             }
             catch (...)
             {
                 // Runtime scheduling must never throw through EeScheduler::accountCycles().
             }
+        }
+
+        uint32_t runModuleStart(uint32_t entry, uint32_t argc, uint32_t argv, uint32_t gp)
+        {
+            const int id = kernel.createModuleStartThread(entry, gp, argc, argv, kModuleStartPriority, kModuleStartStackSize);
+            if (id == 0)
+                return callFunction(entry, argc, argv, 0u, 0u, gp);
+            const uint64_t deadline = totalCycles + kModuleStartMaxCycles;
+            while (!kernel.threadFinished(id) && totalCycles < deadline)
+                runCycles(kDefaultSlice);
+            if (!kernel.threadFinished(id))
+            {
+                std::ostringstream out;
+                out << "[IOP] module_start at 0x" << std::hex << entry << " did not return; its thread keeps running";
+                log(LogLevel::Warning, out.str());
+                return 0u;
+            }
+            return kernel.releaseModuleStartThread(id);
         }
 
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
@@ -624,7 +745,7 @@ namespace ps2x::iop::detail
                     write8(args + argumentSize, 0u);
                 }
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+            const uint32_t startResult = runModuleStart(module.entry, argumentSize, args, module.gp);
             if (args)
                 freeAllocation(args);
             module.resident = startResult == 0u || startResult == 2u;
@@ -655,7 +776,10 @@ namespace ps2x::iop::detail
         ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
         {
             std::vector<uint8_t> image;
-            if (!IopModuleLoader::readElfFromGuest(host, guestAddress, image))
+            const bool fromIopRam = IopModuleLoader::readElf([this](uint32_t address, void *destination, size_t size)
+                                                             { return memory.readRam(address, destination, size); },
+                                                             guestAddress, image);
+            if (!fromIopRam && !IopModuleLoader::readElfFromGuest(host, guestAddress, image))
                 return {true, -1, -1};
             std::ostringstream tag;
             tag << "buffer@0x" << std::hex << guestAddress;
@@ -678,6 +802,53 @@ namespace ps2x::iop::detail
             return true;
         }
 
+        void accountEeCycles()
+        {
+            eeCycleCarry -= static_cast<int64_t>((totalCycles - eeSyncCycle) * 8u);
+            eeSyncCycle = totalCycles;
+        }
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            using namespace ps2x::state;
+            if constexpr (!Ar::kLoading)
+                accountEeCycles();
+            ar.section(fourcc("IOPE"));
+            fields(ar, modules, pendingDmaInterrupts, pendingGuestCallbacks, nextModuleId, moduleCursor, totalCycles, totalInstructions,
+                   eeCycleCarry, secrMcCommandHandler, secrMcDevIdHandler, checkKelfPathCallback);
+            ar.section(fourcc("IMEM"));
+            memory.serialize(ar);
+            ar.section(fourcc("IKRN"));
+            kernel.serialize(ar);
+            ar.section(fourcc("ICDV"));
+            if constexpr (Ar::kLoading)
+                cdvd.loadState(ar);
+            else
+                cdvd.saveState(ar);
+            ar.section(fourcc("IRPC"));
+            rpc.serialize(ar);
+            ar.section(fourcc("IINT"));
+            intrman.serialize(ar);
+            timrman.serialize(ar);
+            ioman.serialize(ar);
+            ar.section(fourcc("ISIO"));
+            sio2.serialize(ar);
+            ar.section(fourcc("ISPU"));
+            spu2.serialize(ar);
+            ar.section(fourcc("IIMP"));
+            imports.serialize(ar);
+            if constexpr (Ar::kLoading)
+            {
+                eeSyncCycle = totalCycles;
+                host.resetAudio();
+                activeCpu = nullptr;
+                servicingDmaInterrupts = false;
+                servicingGuestCallbacks = false;
+                callDepth = 0u;
+            }
+        }
+
         IopHost &host;
         IopMemory memory;
         IopSysmem sysmem;
@@ -691,6 +862,8 @@ namespace ps2x::iop::detail
         IopIntrman intrman;
         IopTimrman timrman;
         IopIoman ioman;
+        IopSio2 sio2;
+        IopSpu2 spu2;
         IopCpuCore cpuCore;
         IopImportRegistry imports;
         IopLoadcore loadcore;
@@ -701,7 +874,8 @@ namespace ps2x::iop::detail
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
-        uint64_t eeCycleCarry = 0;
+        int64_t eeCycleCarry = 0;
+        uint64_t eeSyncCycle = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -741,11 +915,12 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
-        const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
-        m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        m_impl->accountEeCycles();
+        m_impl->eeCycleCarry += static_cast<int64_t>(eeCycles);
+        if (m_impl->eeCycleCarry < static_cast<int64_t>(kIopBatchCycles * 8u))
+            return;
+        m_impl->runCycles(static_cast<uint64_t>(m_impl->eeCycleCarry) / 8u);
+        m_impl->accountEeCycles();
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
@@ -802,6 +977,12 @@ namespace ps2x::iop::detail
         return physical <= IopMemory::RamSize && size <= IopMemory::RamSize - physical;
     }
 
+    uint64_t IopEmulator::eeCyclesUntilBatch() const noexcept
+    {
+        const int64_t threshold = static_cast<int64_t>(kIopBatchCycles * 8u);
+        return m_impl->eeCycleCarry < threshold ? static_cast<uint64_t>(threshold - m_impl->eeCycleCarry) : 0u;
+    }
+
     uint64_t IopEmulator::cycles() const noexcept
     {
         return m_impl->totalCycles;
@@ -822,9 +1003,23 @@ namespace ps2x::iop::detail
         return static_cast<uint32_t>(m_impl->kernel.threadCount());
     }
 
+    std::vector<std::string> IopEmulator::describeThreads() const
+    {
+        return m_impl->kernel.describeThreads();
+    }
+
     uint32_t IopEmulator::rpcServerCount() const noexcept
     {
         return static_cast<uint32_t>(m_impl->rpc.serverCount());
     }
 
+    void IopEmulator::saveState(ps2x::state::Writer &out)
+    {
+        m_impl->serialize(out);
+    }
+
+    void IopEmulator::loadState(ps2x::state::Reader &in)
+    {
+        m_impl->serialize(in);
+    }
 }

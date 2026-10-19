@@ -1,10 +1,12 @@
 #pragma once
 
+#include "ps2x/iop/iop_pad.h"
 #include "ps2x/iop/iop_types.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -96,6 +98,9 @@ namespace ps2x::iop
 
         virtual void audioCommand(uint32_t sid, uint32_t function, GuestBuffer send, GuestBuffer receive) = 0;
 
+        virtual void submitAudio(std::span<const int16_t> samples) { (void)samples; }
+        virtual void resetAudio() {}
+
         virtual std::string hostPath(HostPathKind kind) const = 0;
         virtual std::string translateGuestPath(std::string_view path) const = 0;
         virtual uint64_t openHostFile(std::string_view path) = 0;
@@ -128,6 +133,20 @@ namespace ps2x::iop
             (void)packet;
             (void)packetSize;
             return false;
+        }
+
+        virtual bool readPad(uint32_t port, PadInputState &state)
+        {
+            (void)port;
+            state = {};
+            return false;
+        }
+
+        virtual void padVibration(uint32_t port, uint8_t smallMotor, uint8_t largeMotor)
+        {
+            (void)port;
+            (void)smallMotor;
+            (void)largeMotor;
         }
 
         virtual void log(LogLevel level, std::string_view message) = 0;

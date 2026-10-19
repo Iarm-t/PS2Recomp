@@ -60,6 +60,8 @@ public:
                       uint32_t function,
                       ps2x::iop::GuestBuffer send,
                       ps2x::iop::GuestBuffer receive) override;
+    void submitAudio(std::span<const int16_t> samples) override;
+    void resetAudio() override;
 
     std::string hostPath(ps2x::iop::HostPathKind kind) const override;
     std::string translateGuestPath(std::string_view path) const override;
@@ -84,6 +86,8 @@ public:
                              uint32_t *resultAddress) override;
     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
 
+    bool readPad(uint32_t port, ps2x::iop::PadInputState &state) override;
+
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 
 private:
@@ -101,6 +105,8 @@ private:
     {
         std::FILE *stream = nullptr;
         uint64_t size = 0u;
+        bool cdImage = false;
+        uint64_t cdImageOffset = 0u;
     };
     mutable std::mutex m_hostFileMutex;
     std::unordered_map<uint64_t, HostFile> m_hostFiles;

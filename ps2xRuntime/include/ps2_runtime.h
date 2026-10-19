@@ -150,6 +150,7 @@ struct alignas(16) R5900Context
 
         // Initialize VU0 registers
         vu0_q = 1.0f; // Q register usually initialized to 1.0
+        vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
 
         // Reset COP0 registers
         cop0_random = 47; // Start at maximum value
@@ -237,7 +238,7 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
-inline void ps2TraceGuestWrite(uint8_t *rdram,
+PS2_FORCEINLINE void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
                                uint64_t valueLo,
@@ -255,7 +256,7 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     // TODO we dont need this anymore so on next release it will be deleted
 }
 
-inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
+PS2_FORCEINLINE void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     uint32_t guestAddr,
                                     uint32_t size,
                                     const char *op,
@@ -365,8 +366,8 @@ public:
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
 
 public:
-    void handleSyscall(uint8_t *rdram, R5900Context *ctx);
-    void handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId);
+    bool handleSyscall(uint8_t *rdram, R5900Context *ctx);
+    bool handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId);
     void handleBreak(uint8_t *rdram, R5900Context *ctx);
 
     void handleTrap(uint8_t *rdram, R5900Context *ctx);
@@ -426,7 +427,7 @@ public:
                                  uint32_t tadr,
                                  uint32_t chcr);
 
-    static inline bool isSpecialAddress(uint32_t addr)
+    static PS2_FORCEINLINE bool isSpecialAddress(uint32_t addr)
     {
         return Ps2IsSpecialAddress(addr);
     }
@@ -504,6 +505,8 @@ private:
     mutable std::mutex m_eeKernelStateMutex;
     std::unordered_map<int, std::vector<EeExitHandlerRegistration>> m_eeExitHandlers;
     std::unordered_map<uint32_t, uint32_t> m_eeSyscallOverrides;
+    std::array<std::atomic<uint64_t>, 8> m_eeSyscallOverridePresence{};
+    std::atomic<uint32_t> m_eeSyscallOverridesOutOfRange{0u};
     std::unordered_set<uint32_t> m_eeSyscallMirrorAddresses;
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;

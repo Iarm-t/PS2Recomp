@@ -1,4 +1,5 @@
 #include "Common.h"
+#include "runtime/ee_scheduler.h"
 #include "System.h"
 
 namespace ps2_syscalls
@@ -17,6 +18,10 @@ namespace ps2_syscalls
                 ((static_cast<uint64_t>(frameMode) & 0x1ull) << 1);
 
             gs.smode2 = smode2;
+            if (videoMode == 2 || videoMode == 3)
+            {
+                runtime->eeScheduler().setVBlankPeriodMicroseconds(videoMode == 3 ? 20000u : 16683u);
+            }
 
             // Keep CRT1 enabled after the BIOS syscall selects a display mode.
             if ((gs.pmode & 0x3ull) == 0ull)
@@ -45,11 +50,6 @@ namespace ps2_syscalls
             imr = runtime->memory().gs().imr;
         }
 
-        RUNTIME_LOG("PS2 GsGetIMR: Returning IMR=0x" << std::hex << imr
-                                                     << " pc=0x" << ctx->pc
-                                                     << " ra=0x" << getRegU32(ctx, 31)
-                                                     << std::dec << std::endl);
-
         setReturnU64(ctx, imr); // Return in $v0/$v1
     }
 
@@ -67,13 +67,6 @@ namespace ps2_syscalls
             oldImr = runtime->memory().gs().imr;
             runtime->memory().gs().imr = newImr;
         }
-        RUNTIME_LOG("PS2 GsPutIMR: " << " new=0x" << newImr
-                                     << " a0_64=0x" << GPR_U64(ctx, 4)
-                                     << " a0_32=0x" << getRegU32(ctx, 4)
-                                     << " a1_32=0x" << getRegU32(ctx, 5)
-                                     << " pc=0x" << ctx->pc
-                                     << " ra=0x" << getRegU32(ctx, 31)
-                                     << std::dec << std::endl);
         setReturnU64(ctx, oldImr);
     }
 

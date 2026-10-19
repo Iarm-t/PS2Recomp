@@ -209,7 +209,7 @@ namespace ps2recomp
 
     bool ControlFlowEmitter::emitDirectFunctionJumpIfAvailable(uint32_t target, StaticBranchKind kind, std::string_view indent)
     {
-        if (kind != StaticBranchKind::Jump)
+        if (kind != StaticBranchKind::Jump || !m_gen.directTailCalls())
         {
             return false;
         }
@@ -322,6 +322,29 @@ namespace ps2recomp
 
     void ControlFlowEmitter::emitStaticJump(StaticBranchKind kind)
     {
+        if (m_gen.isRuntimeRelocationSite(m_branchInst.address, RuntimeRelocationKind::Jump26))
+        {
+            m_ss << "    {\n";
+            m_ss << fmt::format("        const uint32_t jumpTarget = ((FAST_READ32(0x{:X}u) & 0x03FFFFFFu) << 2) | 0x{:X}u;\n",
+                                m_branchInst.address, (m_branchInst.address + 4u) & 0xF0000000u);
+            if (kind == StaticBranchKind::Call)
+            {
+                m_ss << fmt::format("        SET_GPR_U32(ctx, 31, 0x{:X}u);\n", fallthroughPc());
+            }
+            emitDelaySlot("        ");
+            m_ss << "        ctx->pc = jumpTarget;\n";
+            if (kind == StaticBranchKind::Call)
+            {
+                emitExternalRegisterCallDispatch("jumpTarget", "        ");
+            }
+            else
+            {
+                emitExternalRegisterJumpDispatch("jumpTarget", RegisterBranchKind::Jump, 0u, "        ");
+            }
+            m_ss << "    }\n";
+            return;
+        }
+
         if (kind == StaticBranchKind::Call)
         {
             m_ss << fmt::format("    SET_GPR_U32(ctx, 31, 0x{:X}u);\n", fallthroughPc());
@@ -406,10 +429,10 @@ namespace ps2recomp
             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
         case OPCODE_BLEZ:
         case OPCODE_BLEZL:
-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
+            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
         case OPCODE_BGTZ:
         case OPCODE_BGTZL:
-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
+            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
         case OPCODE_REGIMM:
             switch (m_branchInst.rt)
             {
@@ -417,12 +440,12 @@ namespace ps2recomp
             case REGIMM_BLTZL:
             case REGIMM_BLTZAL:
             case REGIMM_BLTZALL:
-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
+                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
             case REGIMM_BGEZ:
             case REGIMM_BGEZL:
             case REGIMM_BGEZAL:
             case REGIMM_BGEZALL:
-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
+                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
             default:
                 return "false";
             }

@@ -1,19 +1,134 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_recording.h"
+#include "runtime/gs/gs_threaded_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <string>
 
 namespace
 {
-    static constexpr uint32_t kHostFrameWidth = 640u;
+    struct GsTraceConfig
+    {
+        uint64_t firstTick = 0;
+        uint64_t endTick = 0;
+        uint64_t lastTick = UINT64_MAX;
+        std::FILE *file = nullptr;
+        std::string vramPath;
+    };
 
+    GsTraceConfig g_gsTrace = []
+    {
+        GsTraceConfig result;
+        const char *value = std::getenv("PS2X_GS_TRACE");
+        unsigned long long first = 0;
+        unsigned long long count = 0;
+        char path[512]{};
+        if (value && std::sscanf(value, "%llu:%llu:%511[^\n]", &first, &count, path) == 3)
+        {
+            result.firstTick = first;
+            result.endTick = first + count;
+            result.file = std::fopen(path, "w");
+            result.vramPath = std::string(path) + ".vram";
+        }
+        return result;
+    }();
+
+    inline GsTraceConfig &gsTrace() noexcept
+    {
+        return g_gsTrace;
+    }
+
+    std::FILE *gsTraceFileSlow(const GSRegisters *regs, const uint8_t *vram, uint32_t vramSize)
+    {
+        GsTraceConfig &config = g_gsTrace;
+        const uint64_t tick = regs->vsyncTick.load(std::memory_order_acquire);
+        if (tick < config.firstTick)
+            return nullptr;
+        if (tick >= config.endTick)
+        {
+            std::fclose(config.file);
+            config.file = nullptr;
+            return nullptr;
+        }
+        if (tick != config.lastTick)
+        {
+            if (config.lastTick == UINT64_MAX && vram && vramSize)
+            {
+                if (std::FILE *dump = std::fopen(config.vramPath.c_str(), "wb"))
+                {
+                    std::fwrite(vram, 1, vramSize, dump);
+                    std::fclose(dump);
+                }
+            }
+            config.lastTick = tick;
+            std::fprintf(config.file,
+                         "V tick=%llu pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bgcolor=%llx\n",
+                         static_cast<unsigned long long>(tick),
+                         static_cast<unsigned long long>(regs->pmode),
+                         static_cast<unsigned long long>(regs->smode2),
+                         static_cast<unsigned long long>(regs->dispfb1),
+                         static_cast<unsigned long long>(regs->display1),
+                         static_cast<unsigned long long>(regs->dispfb2),
+                         static_cast<unsigned long long>(regs->display2),
+                         static_cast<unsigned long long>(regs->bgcolor));
+        }
+        return config.file;
+    }
+
+    inline std::FILE *gsTraceFile(const GSRegisters *regs, const uint8_t *vram = nullptr, uint32_t vramSize = 0u) noexcept
+    {
+        if (!g_gsTrace.file || !regs)
+            return nullptr;
+        return gsTraceFileSlow(regs, vram, vramSize);
+    }
+
+    void traceDraw(std::FILE *file, const GSPrimitiveBatch &batch)
+    {
+        const GSDrawState &st = batch.state;
+        const GSContext &c = st.context;
+        const GSPrimReg &p = st.prim;
+        std::fprintf(file,
+                     "D prim=%u iip=%d tme=%d fge=%d abe=%d aa1=%d fst=%d ctxt=%d fix=%d"
+                     " frame=%x/%u/%02x/%08x zbuf=%x/%02x/%d"
+                     " tex0=%x/%u/%02x/%ux%u/tcc%u/tfx%u/cbp%x/cpsm%02x/csm%u/csa%u/cld%u"
+                     " tex1=%llx clamp=%llx alpha=%llx test=%llx fba=%llx scissor=%u-%u,%u-%u ofs=%u,%u"
+                     " texa=%u/%d/%u pabe=%d dthe=%llx colclamp=%llx",
+                     static_cast<unsigned>(p.type), p.iip, p.tme, p.fge, p.abe, p.aa1, p.fst, p.ctxt, p.fix,
+                     c.frame.fbp, c.frame.fbw, c.frame.psm, c.frame.fbmsk, c.zbuf.zbp, c.zbuf.psm, c.zbuf.zmask,
+                     c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, 1u << c.tex0.tw, 1u << c.tex0.th, c.tex0.tcc, c.tex0.tfx,
+                     c.tex0.cbp, c.tex0.cpsm, c.tex0.csm, c.tex0.csa, c.tex0.cld,
+                     static_cast<unsigned long long>(c.tex1), static_cast<unsigned long long>(c.clamp),
+                     static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test),
+                     static_cast<unsigned long long>(c.fba), c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1,
+                     c.xyoffset.ofx, c.xyoffset.ofy, st.texa.ta0, st.texa.aem, st.texa.ta1, st.pabe,
+                     static_cast<unsigned long long>(st.dthe), static_cast<unsigned long long>(st.colclamp));
+        for (uint32_t i = 0; i < batch.vertexCount; ++i)
+        {
+            const GSVertex &v = batch.vertices[i];
+            std::fprintf(file, " | %.2f,%.2f z=%.0f rgba=%02x%02x%02x%02x uv=%.2f,%.2f st=%g,%g q=%g",
+                         v.x, v.y, v.z, v.r, v.g, v.b, v.a, v.u / 16.0, v.v / 16.0, v.s, v.t, v.q);
+        }
+        std::fputc('\n', file);
+    }
+
+    void traceTransfer(std::FILE *file, const GSBitBltBuf &b, const GSTrxPos &pos, const GSTrxReg &reg, uint32_t dir)
+    {
+        std::fprintf(file, "T dir=%u src=%x/%u/%02x dst=%x/%u/%02x ss=%u,%u ds=%u,%u size=%ux%u\n",
+                     dir, b.sbp, b.sbw, b.spsm, b.dbp, b.dbw, b.dpsm, pos.ssax, pos.ssay, pos.dsax, pos.dsay, reg.rrw, reg.rrh);
+    }
+}
+
+namespace
+{
     GSPrimReg decodePrimRegister(uint64_t value)
     {
         GSPrimReg prim{};
@@ -106,7 +221,7 @@ namespace
 
 
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(GSThreadedBackend::MakeDefault())
 {
     reset();
 }
@@ -117,7 +232,9 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
     if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
+        m_backend = GSThreadedBackend::MakeDefault();
+    if (!dynamic_cast<GSRecordingBackend *>(m_backend.get()))
+        m_backend = GSRecordingBackend::WrapFromEnvironment(std::move(m_backend), privRegs);
     m_backend->Initialize(vram, vramSize);
     reset();
 }
@@ -176,6 +293,12 @@ void GS::reset()
         m_hasHostPresentationFrame = false;
     }
 
+    static const bool s_defaultDebugHistoryPaused = []
+    {
+        const char *env = std::getenv("PS2X_GS_DEBUG_HISTORY");
+        return !(env && *env && std::strcmp(env, "0") != 0);
+    }();
+    m_debugHistoryPaused = s_defaultDebugHistoryPaused;
     m_debugHistoryWrite = 0;
     m_debugHistoryCount = 0;
     m_debugNextSeq = 1;
@@ -606,35 +729,21 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     if (outUsedPreferred)
         *outUsedPreferred = m_hostPresentationUsedPreferred;
 
-    const size_t packedRowBytes = static_cast<size_t>(outWidth) * 4u;
-    outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
-    if (outWidth != 0u && outHeight != 0u)
+    const size_t packedBytes = static_cast<size_t>(outWidth) * static_cast<size_t>(outHeight) * 4u;
+    if (packedBytes > m_hostPresentationFrame.size())
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
-        for (uint32_t y = 0; y < outHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * packedRowBytes;
-            if (srcOffset + packedRowBytes > m_hostPresentationFrame.size() ||
-                dstOffset + packedRowBytes > outPixels.size())
-            {
-                outPixels.clear();
-                outWidth = 0u;
-                outHeight = 0u;
-                if (outDisplayFbp)
-                    *outDisplayFbp = 0u;
-                if (outSourceFbp)
-                    *outSourceFbp = 0u;
-                if (outUsedPreferred)
-                    *outUsedPreferred = false;
-                return false;
-            }
-
-            std::memcpy(outPixels.data() + dstOffset,
-                        m_hostPresentationFrame.data() + srcOffset,
-                        packedRowBytes);
-        }
+        outPixels.clear();
+        outWidth = 0u;
+        outHeight = 0u;
+        if (outDisplayFbp)
+            *outDisplayFbp = 0u;
+        if (outSourceFbp)
+            *outSourceFbp = 0u;
+        if (outUsedPreferred)
+            *outUsedPreferred = false;
+        return false;
     }
+    outPixels.assign(m_hostPresentationFrame.begin(), m_hostPresentationFrame.begin() + static_cast<std::ptrdiff_t>(packedBytes));
     return true;
 }
 
@@ -645,7 +754,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         return;
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
+    {
+        m_backend->Flush();
         return;
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
@@ -702,7 +814,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 for (uint32_t r = 0; r < nreg; ++r)
                 {
                     if (offset + 16 > sizeBytes)
+                    {
+                        m_backend->Flush();
                         return;
+                    }
                     uint64_t lo = loadLE64(data + offset);
                     uint64_t hi = loadLE64(data + offset + 8);
                     offset += 16;
@@ -717,7 +832,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 for (uint32_t r = 0; r < nreg; ++r)
                 {
                     if (offset + 8 > sizeBytes)
+                    {
+                        m_backend->Flush();
                         return;
+                    }
                     writeRegisterUnlocked(regs[r], loadLE64(data + offset));
                     offset += 8;
                 }
@@ -734,6 +852,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             offset += imageBytes;
         }
     }
+    m_backend->Flush();
 }
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
@@ -769,6 +888,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
         return true; });
 
+    m_backend->Flush();
     if (!processed)
         return false;
 
@@ -785,6 +905,8 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+    if (m_backend)
+        m_backend->Flush();
 }
 
 void GS::uploadImageNativeUnlocked(uint64_t bitbltbuf,
@@ -1239,7 +1361,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        m_backend->LoadClut(t, m_texclut);
+        if (t.cld != 0u)
+            m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1270,7 +1393,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        m_backend->LoadClut(t, m_texclut);
+        if (t.cld != 0u)
+            m_backend->LoadClut(t, m_texclut);
         break;
     }
     case GS_REG_XYOFFSET_1:
@@ -1383,6 +1507,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     case GS_REG_TRXDIR:
     {
         m_trxdir = static_cast<uint32_t>(value & 0x3);
+        if (std::FILE *trace = gsTraceFile(m_privRegs))
+            traceTransfer(trace, m_bitbltbuf, m_trxpos, m_trxreg, m_trxdir);
 
         if (m_backend)
         {
@@ -1463,6 +1589,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_SIGNAL:
     {
+        if (m_backend)
+        {
+            m_backend->Flush();
+            m_backend->Sync(GSSyncReason::Finish);
+        }
         if (m_privRegs)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
@@ -1487,6 +1618,11 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_LABEL:
     {
+        if (m_backend)
+        {
+            m_backend->Flush();
+            m_backend->Sync(GSSyncReason::Finish);
+        }
         if (m_privRegs)
         {
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
@@ -1577,6 +1713,27 @@ void GS::vertexKick(bool drawing)
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
+        if (gsTrace().file && gsTrace().lastTick == UINT64_MAX)
+        {
+            m_backend->Flush();
+            m_backend->Sync(GSSyncReason::DebugReadback);
+        }
+        if (std::FILE *trace = gsTraceFile(m_privRegs, m_localMemoryStorage, m_localMemorySize))
+        {
+            traceDraw(trace, batch);
+            static uint32_t tracedDraws = 0u;
+            static const long dumpDraw = std::getenv("PS2X_GS_TRACE_DUMP_DRAW") ? std::atol(std::getenv("PS2X_GS_TRACE_DUMP_DRAW")) : -1;
+            if (static_cast<long>(tracedDraws++) == dumpDraw)
+            {
+                m_backend->Flush();
+                m_backend->Sync(GSSyncReason::DebugReadback);
+                if (std::FILE *raw = std::fopen((gsTrace().vramPath + ".draw").c_str(), "wb"))
+                {
+                    std::fwrite(m_localMemoryStorage, 1, m_localMemorySize, raw);
+                    std::fclose(raw);
+                }
+            }
+        }
         recordDrawDebugEventUnlocked(needed);
     }
 
@@ -1609,6 +1766,13 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (std::FILE *trace = gsTraceFile(m_privRegs))
+    {
+        std::fprintf(trace, "I %u ", sizeBytes);
+        for (uint32_t i = 0; i < sizeBytes; ++i)
+            std::fprintf(trace, "%02x", data[i]);
+        std::fputc(0x0A, trace);
+    }
     if (m_backend)
         m_backend->UploadImage(data, sizeBytes);
 }
@@ -1635,7 +1799,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
     if (!backend)
-        backend = std::make_unique<GSCpuBackend>();
+        backend = GSThreadedBackend::MakeDefault();
 
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);

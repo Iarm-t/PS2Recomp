@@ -1,9 +1,11 @@
 #pragma once
 
 #include "ps2x/iop/iop_types.h"
+#include "ps2x/state_io.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 
 namespace ps2x::iop
@@ -38,11 +40,30 @@ namespace ps2x::iop::detail
         {
             return executeGuestFunction(address, a0, a1, a2, a3, gp);
         }
+        [[nodiscard]] virtual uint32_t executeServerFunction(uint32_t address,
+                                                             uint32_t a0,
+                                                             uint32_t a1,
+                                                             uint32_t a2,
+                                                             uint32_t a3,
+                                                             uint32_t gp,
+                                                             uint32_t priority)
+        {
+            (void)priority;
+            return executeGuestFunction(address, a0, a1, a2, a3, gp);
+        }
     };
 
     class IopRpcBridge
     {
     public:
+        struct DmaCallback
+        {
+            uint32_t function = 0;
+            uint32_t argument = 0;
+            uint32_t gp = 0;
+            uint32_t bytes = 0;
+        };
+
         IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept;
 
         void reset();
@@ -54,8 +75,17 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] bool hasServer(uint32_t sid) const noexcept;
         [[nodiscard]] size_t serverCount() const noexcept { return m_servers.size(); }
+        [[nodiscard]] std::optional<DmaCallback> takeDmaCallback() noexcept;
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_servers, m_nextDmaId, m_dmaCallback);
+        }
 
     private:
+        [[nodiscard]] uint32_t setDma(uint32_t descriptorAddress, uint32_t descriptorCount, uint32_t &bytes);
+
         struct RpcServer
         {
             uint32_t sid = 0;
@@ -73,6 +103,7 @@ namespace ps2x::iop::detail
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
         uint32_t m_nextDmaId = 1u;
+        std::optional<DmaCallback> m_dmaCallback;
         bool m_sifInitialized = false;
     };
 }

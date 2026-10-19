@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <array>
+#include <random>
 #include <vector>
 
 namespace
@@ -309,6 +311,103 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
         });
 
+        tc.Run("EE timer overflows missed while the flag is set are delivered one per acknowledge", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kTimer0Count = 0x10000000u;
+            constexpr uint32_t kTimer0Mode = 0x10000010u;
+            constexpr uint32_t kCue = 1u << 7u;
+            constexpr uint32_t kOvfe = 1u << 9u;
+            constexpr uint32_t kOvff = 1u << 11u;
+            constexpr uint64_t kCyclesPerOverflow = 0x10000ull * 2u;
+
+            mem.writeIORegister(kTimer0Count, 0u);
+            mem.writeIORegister(kTimer0Mode, kCue | kOvfe | kOvff);
+
+            t.Equals(mem.advanceEeTimers(3u * kCyclesPerOverflow), 1u, "three overflows at once should raise TIM0");
+            t.Equals(mem.readIORegister(kTimer0Count), 0u, "COUNT should wrap back to zero after exact overflows");
+
+            uint32_t delivered = 1u;
+            for (int acknowledge = 0; acknowledge < 4; ++acknowledge)
+            {
+                mem.writeIORegister(kTimer0Mode, kCue | kOvfe | kOvff);
+                if (mem.advanceEeTimers(1u) == 1u)
+                {
+                    ++delivered;
+                }
+            }
+            t.Equals(delivered, 3u, "every overflow should reach the handler, one per OVFF acknowledge");
+            t.IsTrue((mem.readIORegister(kTimer0Mode) & kOvff) == 0u, "OVFF should stay clear once the backlog is drained");
+        });
+
+        tc.Run("EE timers advanced lazily match an eager read after every step", [](TestCase &t)
+        {
+            constexpr uint32_t kBases[] = {0x10000000u, 0x10000800u, 0x10001000u, 0x10001800u};
+            constexpr uint32_t kZret = 1u << 6u;
+            constexpr uint32_t kCue = 1u << 7u;
+            constexpr uint32_t kCmpe = 1u << 8u;
+            constexpr uint32_t kOvfe = 1u << 9u;
+            constexpr uint32_t kEquf = 1u << 10u;
+            constexpr uint32_t kOvff = 1u << 11u;
+            const uint32_t modes[] = {0u | kCue | kCmpe | kZret, 1u | kCue | kOvfe, 2u | kCue | kCmpe | kOvfe, 3u | kCue | kCmpe};
+            const uint32_t compares[] = {5u, 0x100u, 0x30u, 0u};
+            const uint32_t counts[] = {0u, 0xFF00u, 0x10u, 0x7u};
+
+            PS2Memory eager;
+            PS2Memory lazy;
+            t.IsTrue(eager.initialize() && lazy.initialize(), "PS2Memory initialize should succeed");
+            for (PS2Memory *mem : {&eager, &lazy})
+            {
+                for (size_t i = 0; i < 4u; ++i)
+                {
+                    mem->writeIORegister(kBases[i], counts[i]);
+                    mem->writeIORegister(kBases[i] + 0x20u, compares[i]);
+                    mem->writeIORegister(kBases[i] + 0x10u, modes[i]);
+                }
+            }
+
+            uint32_t seed = 12345u;
+            bool allMatch = true;
+            int interrupts = 0;
+            for (int step = 0; step < 200000; ++step)
+            {
+                seed = seed * 1103515245u + 12345u;
+                const uint64_t cycles = 1u + ((seed >> 16u) % 97u);
+                const uint32_t eagerMask = eager.advanceEeTimers(cycles);
+                for (uint32_t base : kBases)
+                {
+                    (void)eager.readIORegister(base);
+                }
+                const uint32_t lazyMask = lazy.advanceEeTimers(cycles);
+                allMatch = allMatch && eagerMask == lazyMask &&
+                           eager.cyclesUntilNextEeTimerInterrupt() == lazy.cyclesUntilNextEeTimerInterrupt();
+                if (eagerMask != 0u)
+                {
+                    ++interrupts;
+                    for (PS2Memory *mem : {&eager, &lazy})
+                    {
+                        for (size_t i = 0; i < 4u; ++i)
+                        {
+                            const uint32_t mode = mem->readIORegister(kBases[i] + 0x10u);
+                            mem->writeIORegister(kBases[i] + 0x10u, mode | kEquf | kOvff);
+                        }
+                    }
+                }
+                if (step % 5000 == 4999)
+                {
+                    for (size_t i = 0; i < 4u; ++i)
+                    {
+                        allMatch = allMatch && eager.readIORegister(kBases[i]) == lazy.readIORegister(kBases[i]) &&
+                                   eager.readIORegister(kBases[i] + 0x10u) == lazy.readIORegister(kBases[i] + 0x10u);
+                    }
+                }
+            }
+            t.IsTrue(interrupts > 100, "the scenario should raise many timer interrupts");
+            t.IsTrue(allMatch, "lazy timer advance must raise the same interrupts in the same step and keep the same COUNT and MODE");
+        });
+
         tc.Run("scratchpad alias accesses the same bytes as base", [](TestCase &t)
         {
             PS2Memory mem;
@@ -529,6 +628,82 @@ void register_ps2_memory_tests()
             t.Equals(sy, 0x00000001u, "zero-extend y");
             t.Equals(sz, 0x00007FFFu, "zero-extend z");
             t.Equals(sw, 0x00008001u, "zero-extend w");
+        });
+
+        tc.Run("VIF fast UNPACK matches scalar semantics across formats modes cycles and wrap", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::mt19937 random(0x564946u);
+            std::array<uint32_t, PS2_VU1_DATA_SIZE / 4u> expected;
+            bool matches = true;
+            for (uint32_t vl = 0u; vl < 3u && matches; ++vl)
+            for (uint32_t components = 1u; components <= 4u && matches; ++components)
+            for (uint32_t unsignedData = 0u; unsignedData <= 1u && matches; ++unsignedData)
+            for (uint32_t mode = 0u; mode < 3u && matches; ++mode)
+            for (uint32_t count : {1u, 7u, 256u})
+            for (const auto cycle : {std::array<uint32_t, 2>{1u, 1u}, {7u, 3u}, {255u, 1u}})
+            {
+                for (auto &value : expected)
+                    value = random();
+                std::memcpy(mem.getVU1Data(), expected.data(), PS2_VU1_DATA_SIZE);
+                std::array<uint32_t, 4> row;
+                for (auto &value : row)
+                    value = random();
+                std::vector<uint8_t> packet;
+                appendU32(packet, makeVifCmd(0x01u, 0u, (cycle[1] << 8u) | (cycle[0] & 255u)));
+                appendU32(packet, makeVifCmd(0x05u, 0u, mode));
+                appendU32(packet, makeVifCmd(0x30u, 0u, 0u));
+                for (const auto value : row)
+                    appendU32(packet, value);
+                const uint32_t start = 1021u;
+                appendU32(packet, makeVifCmd(static_cast<uint8_t>(0x60u | ((components - 1u) << 2u) | vl),
+                                            static_cast<uint8_t>(count), start | (unsignedData << 14u)));
+                uint32_t destination = start;
+                uint32_t cyclePosition = 0u;
+                const uint32_t bytes = 4u >> vl;
+                for (uint32_t vector = 0u; vector < count; ++vector)
+                {
+                    auto *lanes = expected.data() + (destination & 1023u) * 4u;
+                    for (uint32_t lane = 0u; lane < components; ++lane)
+                    {
+                        const uint32_t raw = random();
+                        for (uint32_t byte = 0u; byte < bytes; ++byte)
+                            packet.push_back(static_cast<uint8_t>(raw >> (byte * 8u)));
+                        lanes[lane] = vl == 0u ? raw : vl == 1u ?
+                            (unsignedData ? raw & 65535u : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)))) :
+                            (unsignedData ? raw & 255u : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw))));
+                    }
+                    if (components == 1u)
+                        lanes[1] = lanes[2] = lanes[3] = lanes[0];
+                    if (mode != 0u)
+                        for (uint32_t lane = 0u; lane < 4u; ++lane)
+                        {
+                            lanes[lane] += row[lane];
+                            if (mode == 2u)
+                                row[lane] = lanes[lane];
+                        }
+                    ++destination;
+                    if (++cyclePosition == cycle[1])
+                    {
+                        cyclePosition = 0u;
+                        destination += cycle[0] - cycle[1];
+                    }
+                }
+                while (packet.size() & 3u)
+                    packet.push_back(0u);
+                mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+                matches = std::memcmp(mem.getVU1Data(), expected.data(), PS2_VU1_DATA_SIZE) == 0 &&
+                          std::memcmp(mem.vif1_regs.row, row.data(), sizeof(row)) == 0;
+                if (!matches)
+                {
+                    t.IsTrue(false, "UNPACK case vl=" + std::to_string(vl) + " components=" + std::to_string(components) +
+                        " unsigned=" + std::to_string(unsignedData) + " mode=" + std::to_string(mode) +
+                        " count=" + std::to_string(count) + " cycle=" + std::to_string(cycle[0]) + ":" + std::to_string(cycle[1]));
+                    return;
+                }
+            }
+            t.IsTrue(matches, "UNPACK changed vector data, preserved lanes, wrapping row arithmetic, or skipped destinations");
         });
 
         tc.Run("VIF UNPACK bit15 adds TOPS to destination address", [](TestCase &t)
@@ -1142,6 +1317,46 @@ void register_ps2_memory_tests()
                 }
             }
             t.IsTrue(contentOk, "scratchpad alias chain payload should match scratchpad bytes");
+        });
+
+        tc.Run("GIF DMA chain longer than 4096 tags is transferred to its END tag", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kGifCh = 0x1000A000u;
+            constexpr uint32_t kChain = 0x00100000u;
+            constexpr uint32_t kCntTags = 6000u;
+
+            uint8_t *rdram = mem.getRDRAM();
+            uint32_t addr = kChain;
+            for (uint32_t i = 0; i <= kCntTags; ++i)
+            {
+                const bool last = i == kCntTags;
+                writeDmaTag(rdram, addr, makeDmaTag(1u, last ? 7u : 1u, 0u, false));
+                const uint32_t marker = last ? 0xE0D0E0D0u : i;
+                std::memset(rdram + addr + 16u, 0, 16u);
+                std::memcpy(rdram + addr + 16u, &marker, sizeof(marker));
+                addr += 32u;
+            }
+
+            std::vector<uint8_t> captured;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                captured.insert(captured.end(), data, data + sizeBytes);
+            });
+
+            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kChain), "write TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR STR|CHAIN should succeed");
+            mem.processPendingTransfers();
+
+            t.Equals(captured.size(), static_cast<size_t>((kCntTags + 1u) * 16u), "every tag's payload should be transferred");
+            uint32_t lastMarker = 0u;
+            if (captured.size() >= 16u)
+            {
+                std::memcpy(&lastMarker, captured.data() + captured.size() - 16u, sizeof(lastMarker));
+            }
+            t.Equals(lastMarker, 0xE0D0E0D0u, "the END tag's payload should arrive last");
         });
 
         tc.Run("native GIF image upload recognizes canonical load-image chain", [](TestCase &t)
@@ -2112,7 +2327,7 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "VIF1 DIRECT image should update GS VRAM through GIF path2");
         });
 
-        tc.Run("VIF1 DIRECT image tag can continue with raw image qwords", [](TestCase &t)
+        tc.Run("VIF1 DIRECT image tag continues in the next DIRECT payload", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -2138,9 +2353,14 @@ void register_ps2_memory_tests()
             gs.writeRegister(GS_REG_TRXDIR, 0ull);
 
             std::vector<uint8_t> packet;
-            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
+            for (uint32_t i = 0; i < 3u; ++i)
+                appendU32(packet, makeVifCmd(0x00u, 0u, 0u));
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            for (uint32_t i = 0; i < 3u; ++i)
+                appendU32(packet, makeVifCmd(0x00u, 0u, 0u));
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
             for (uint32_t i = 0; i < 16u; ++i)
             {
                 packet.push_back(static_cast<uint8_t>(0xA0u + i));
@@ -2162,7 +2382,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
+            t.IsTrue(imageOk, "the next DIRECT payload should continue the PATH2 image upload");
         });
 
         tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
@@ -2187,13 +2407,18 @@ void register_ps2_memory_tests()
             gs.writeRegister(GS_REG_TRXDIR, 0ull);
 
             std::vector<uint8_t> packet;
-            appendU32(packet, makeVifCmd(0x50u, 0u, 3u)); // PACKED tag + A+D + IMAGE tag.
+            for (uint32_t i = 0; i < 3u; ++i)
+                appendU32(packet, makeVifCmd(0x00u, 0u, 0u));
+            appendU32(packet, makeVifCmd(0x50u, 0u, 3u));
             appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, 1u, false));
             appendU64(packet, 0x0Eull);
             appendU64(packet, 0x8000008000ull); // TEXA, harmless setup preceding the IMAGE tag.
             appendU64(packet, GS_REG_TEXA);
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            for (uint32_t i = 0; i < 3u; ++i)
+                appendU32(packet, makeVifCmd(0x00u, 0u, 0u));
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
             for (uint32_t i = 0; i < 16u; ++i)
                 packet.push_back(static_cast<uint8_t>(0xC0u + i));
 
@@ -2213,7 +2438,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
+            t.IsTrue(imageOk, "image continuation after packed setup should come from the next DIRECT payload");
         });
 
         tc.Run("unaligned accesses throw", [](TestCase &t)

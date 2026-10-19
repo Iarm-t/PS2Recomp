@@ -87,7 +87,7 @@ namespace ps2recomp
             case VU0_CR_CLIP:
                 return fmt::format("ctx->vu0_clip_flags = GPR_U32(ctx, {}) & 0x00FFFFFFu;", rt);
             case VU0_CR_R:
-                return fmt::format("ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(GPR_U32(ctx, {}))));", rt);
+                return fmt::format("ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(0x3F800000u | (GPR_U32(ctx, {}) & 0x007FFFFFu))));", rt);
             case VU0_CR_I:
                 return fmt::format("{{ uint32_t tmp = GPR_U32(ctx, {}); std::memcpy(&ctx->vu0_i, &tmp, sizeof(tmp)); }}", rt);
             case VU0_CR_Q:
@@ -227,7 +227,9 @@ namespace ps2recomp
                 case VU0_S2_VABS:
                 {
                     uint8_t dest_mask = inst.vectorInfo.vectorField;
-                    return fmt::format("{{ __m128 res = _mm_and_ps(ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))); "
+                    return fmt::format("{{ const __m128i bits = _mm_castps_si128(ctx->vu0_vf[{}]); "
+                                       "const __m128i denormal = _mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128()); "
+                                       "__m128 res = _mm_castsi128_ps(_mm_andnot_si128(denormal, _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)))); "
                                        "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                                        "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                                        inst.rd,
@@ -267,17 +269,15 @@ namespace ps2recomp
                     std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
 
                     return fmt::format(
-                        "{{ __m128 fs = ctx->vu0_vf[{}]; "
-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
-                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
+                        "{{ uint32_t fs_bits[4]; std::memcpy(fs_bits, &ctx->vu0_vf[{}], sizeof(fs_bits)); "
+                        "float ft_w = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
+                        "uint32_t w_bits; std::memcpy(&w_bits, &ft_w, sizeof(w_bits)); "
+                        "const int32_t limit = (w_bits & 0x7F800000u) != 0u ? (int32_t)(w_bits & 0x7FFFFFFFu) : 0x007FFFFF; "
+                        "uint32_t flags = 0u; "
+                        "for (uint32_t c = 0; c < 3u; ++c) {{ "
+                        "if ((int32_t)fs_bits[c] > limit) flags |= 1u << (c * 2u); "
+                        "if ((int32_t)(fs_bits[c] ^ 0x80000000u) > limit) flags |= 2u << (c * 2u); }} "
+                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | flags) & 0xFFFFFF; }}",
                         inst.rd, inst.rt, inst.rt, shuffle_pattern);
                 }
                 case VU0_S2_VNOP:

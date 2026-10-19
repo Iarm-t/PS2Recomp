@@ -383,16 +383,26 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_recording.cpp
+    src/lib/gs/gs_threaded_backend.cpp
+    src/lib/gs/gs_swizzle.cpp
+    src/lib/gs/gs_cpu_raster.cpp
+    src/lib/gs/gs_band_pool.cpp
+    src/lib/gs/gpu/gs_gl.cpp
+    src/lib/gs/gpu/gs_gpu_backend.cpp
+    src/lib/gs/gpu/gs_gpu_shaders.cpp
     src/lib/ps2_iop_host.cpp
+    src/lib/ps2_async_vif.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_host_input.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
+    src/lib/ps2_cd_image.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_save_state.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
-    src/lib/vu/ps2_vu1_upper.cpp
-    src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
 
@@ -554,9 +564,20 @@ if(PS2X_IS_VITA)
     endif()
 endif()
 
+if(WIN32)
+    target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32)
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_runtime)
     EnableFastReleaseMode(ps2EntryRunner)
+    if(MSVC)
+        set_source_files_properties(
+            src/lib/gs/gs_frontend.cpp
+            src/lib/gs/gs_cpu_backend.cpp
+            src/lib/gs/gs_cpu_raster.cpp
+            PROPERTIES COMPILE_OPTIONS "/fp:precise;/Zi")
+    endif()
 
     if(WIN32 AND NOT PS2X_SHOW_WINDOWS_CONSOLE)
         if(MSVC)

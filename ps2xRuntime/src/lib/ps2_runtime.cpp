@@ -1,17 +1,24 @@
+#include "runtime/ps2_async_vif.h"
 #include "ps2_runtime.h"
+#include "runtime/ps2_save_state.h"
+#include "runtime/ps2_display_options.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_shared_present.h"
 #include "runtime/ee_scheduler.h"
+#include "ThreadPriority.h"
 #include "ThreadNaming.h"
+#include "GuestKernelMemory.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
+#include "ps2_host_input.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
@@ -26,10 +33,55 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <rlgl.h>
 
 namespace ps2_stubs
 {
     void resetSifState();
+}
+
+namespace ps2_host_display
+{
+    std::atomic<float> displayAspect{4.0f / 3.0f};
+    std::atomic<float> windowAspect{4.0f / 3.0f};
+    std::atomic<bool> fitWindow{false};
+    bool startMaximized = false;
+    bool headless = false;
+
+    void setAspect(float aspect)
+    {
+        displayAspect.store(aspect, std::memory_order_relaxed);
+    }
+
+    float aspect()
+    {
+        return fitWindow.load(std::memory_order_relaxed)
+                   ? windowAspect.load(std::memory_order_relaxed)
+                   : displayAspect.load(std::memory_order_relaxed);
+    }
+
+    void setFitWindow(bool enabled)
+    {
+        fitWindow.store(enabled, std::memory_order_relaxed);
+    }
+
+    void updateWindowAspect()
+    {
+        const int width = GetScreenWidth();
+        const int height = GetScreenHeight();
+        if (width > 0 && height > 0)
+            windowAspect.store(static_cast<float>(width) / static_cast<float>(height), std::memory_order_relaxed);
+    }
+
+    void setStartMaximized(bool enabled)
+    {
+        startMaximized = enabled;
+    }
+
+    void setHeadless(bool enabled)
+    {
+        headless = enabled;
+    }
 }
 
 #define ELF_MAGIC 0x464C457F // "\x7FELF" in little endian
@@ -37,17 +89,12 @@ namespace ps2_stubs
 #define EM_MIPS 8            // MIPS architecture
 #define PT_LOAD 1            // Loadable segment
 
-static constexpr int FB_WIDTH = 640;
-static constexpr int FB_HEIGHT = 512;
-static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
-static constexpr uint32_t DEFAULT_FB_SIZE = FB_WIDTH * FB_HEIGHT * 4;
-static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x10000u);
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
 #else
-static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
-static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+static constexpr int HOST_WINDOW_WIDTH = 640;
+static constexpr int HOST_WINDOW_HEIGHT = 480;
 #endif
 struct ElfHeader
 {
@@ -108,6 +155,109 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
+    thread_local uint64_t g_guestJumpSerial = 0u;
+
+    struct BranchEvent
+    {
+        uint32_t kind;
+        uint32_t source;
+        uint32_t target;
+        uint32_t sp;
+        uint32_t ra;
+        uint32_t extra;
+    };
+
+    struct BranchTrace
+    {
+        std::vector<BranchEvent> events;
+        size_t next = 0u;
+        bool wrapped = false;
+    };
+
+    const size_t g_branchTraceSize = []() -> size_t
+    {
+        const char *value = std::getenv("PS2X_BRANCH_TRACE");
+        return value ? static_cast<size_t>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+
+    const bool g_dispatchHistoryEnabled = []() -> bool
+    {
+        const char *value = std::getenv("PS2X_DISPATCH_HISTORY");
+        return g_branchTraceSize != 0u || (value && *value && std::string_view(value) != "0");
+    }();
+
+    const bool g_singleLookup = []() -> bool
+    {
+        const char *setting = std::getenv("PS2X_EE_SINGLE_LOOKUP");
+        return !setting || std::string_view(setting) != "0";
+    }();
+
+    BranchTrace *branchTraceSlow()
+    {
+        const size_t size = g_branchTraceSize;
+        if (size == 0u)
+        {
+            return nullptr;
+        }
+        thread_local BranchTrace trace;
+        if (trace.events.empty())
+        {
+            trace.events.resize(size);
+        }
+        return &trace;
+    }
+
+    inline BranchTrace *branchTrace()
+    {
+        if (g_branchTraceSize == 0u)
+        {
+            return nullptr;
+        }
+        return branchTraceSlow();
+    }
+
+    inline void pushBranchEvent(uint32_t kind, uint32_t source, uint32_t target, R5900Context *ctx, uint32_t extra)
+    {
+        if (g_branchTraceSize == 0u)
+        {
+            return;
+        }
+        BranchTrace *trace = branchTraceSlow();
+        if (!trace)
+        {
+            return;
+        }
+        trace->events[trace->next] = {kind, source, target, static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)),
+                                      static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), extra};
+        trace->next = (trace->next + 1u) % trace->events.size();
+        if (trace->next == 0u)
+        {
+            trace->wrapped = true;
+        }
+    }
+
+    void dumpBranchTrace()
+    {
+        BranchTrace *trace = branchTrace();
+        if (!trace)
+        {
+            return;
+        }
+        const char *path = std::getenv("PS2X_BRANCH_TRACE_FILE");
+        FILE *file = path ? std::fopen(path, "w") : nullptr;
+        FILE *out = file ? file : stderr;
+        const size_t count = trace->wrapped ? trace->events.size() : trace->next;
+        static const char *const kKinds[] = {"call", "ret", "jump", "sched"};
+        for (size_t i = 0; i < count; ++i)
+        {
+            const BranchEvent &e = trace->events[(trace->next + trace->events.size() - count + i) % trace->events.size()];
+            std::fprintf(out, "%s src=%08x dst=%08x sp=%08x ra=%08x x=%08x\n", kKinds[e.kind & 3u], e.source, e.target, e.sp, e.ra, e.extra);
+        }
+        if (file)
+        {
+            std::fclose(file);
+        }
+    }
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -151,8 +301,12 @@ namespace
         return true;
     }
 
-    void pushDispatchPc(uint32_t pc)
+    inline void pushDispatchPc(uint32_t pc)
     {
+        if (!g_dispatchHistoryEnabled)
+        {
+            return;
+        }
         DispatchHistory &h = g_dispatchHistory;
         h.pcs[h.next] = pc;
         h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
@@ -373,108 +527,79 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight,
+                        bool hashImages, GSSharedPresent::Frame &diagnostic)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static bool s_hasLatchedInitialFrame = false;
-    static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
-    static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
-    static bool s_lastPreferred = false;
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
-    static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    static uint64_t s_lastHash = 0u;
+    diagnostic.contentHash = s_lastHash;
+    diagnostic.hashValid = hashImages && s_lastWidth != 0u && s_lastHeight != 0u;
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
+    if (currentTick == s_lastPresentationTick)
     {
-        rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
+        outWidth = s_lastWidth;
+        outHeight = s_lastHeight;
+        return;
     }
-    else if (s_hasUploadedFrame)
+    s_lastPresentationTick = currentTick;
+    rt->gs().latchHostPresentationFrame();
+    if (GSSharedPresent::Active())
     {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+        outWidth = outHeight = 0u;
         return;
     }
 
-    s_scratch.clear();
     uint32_t width = 0u;
     uint32_t height = 0u;
-    uint32_t displayFbp = 0u;
-    uint32_t sourceFbp = 0u;
-    bool usedPreferredDisplaySource = false;
-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
-                                                   width,
-                                                   height,
-                                                   &displayFbp,
-                                                   &sourceFbp,
-                                                   &usedPreferredDisplaySource))
+    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch, width, height) || width == 0u || height == 0u)
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
-        UpdateTexture(tex, blank.data);
-        UnloadImage(blank);
-        outWidth = FB_WIDTH;
-        outHeight = DEFAULT_DISPLAY_HEIGHT;
-        s_lastWidth = outWidth;
-        s_lastHeight = outHeight;
-        s_hasUploadedFrame = true;
+        diagnostic.hashValid = false;
+        outWidth = s_lastWidth = 0u;
+        outHeight = s_lastHeight = 0u;
         return;
     }
 
-    PS2_IF_AGRESSIVE_LOGS({
-        static uint32_t s_uploadDebugCount = 0u;
-        if (s_uploadDebugCount < 128u ||
-            displayFbp != s_lastDisplayFbp ||
-            sourceFbp != s_lastSourceFbp ||
-            usedPreferredDisplaySource != s_lastPreferred ||
-            width != s_lastWidth ||
-            height != s_lastHeight)
-        {
-            std::cout << "[frame:upload] idx=" << s_uploadDebugCount
-                      << " tick=" << currentTick
-                      << " displayFbp=" << displayFbp
-                      << " sourceFbp=" << sourceFbp
-                      << " size=" << width << "x" << height
-                      << " preferred=" << static_cast<uint32_t>(usedPreferredDisplaySource ? 1u : 0u)
-                      << std::endl;
-        }
-        ++s_uploadDebugCount;
-    });
-    s_lastDisplayFbp = displayFbp;
-    s_lastSourceFbp = sourceFbp;
-    s_lastPreferred = usedPreferredDisplaySource;
-    s_lastWidth = width;
-    s_lastHeight = height;
-
-    std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
-    if (!s_scratch.empty() && width != 0u && height != 0u)
+    if (tex.id == 0 || static_cast<uint32_t>(tex.width) != width || static_cast<uint32_t>(tex.height) != height)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
-        const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
-        const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
-        for (uint32_t y = 0; y < copyHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > s_scratch.size() ||
-                dstOffset + copyRowBytes > s_uploadBuffer.size())
-            {
-                break;
-            }
-            std::memcpy(s_uploadBuffer.data() + dstOffset, s_scratch.data() + srcOffset, copyRowBytes);
-        }
+        if (tex.id != 0)
+            UnloadTexture(tex);
+        Image image = GenImageColor(static_cast<int>(width), static_cast<int>(height), BLACK);
+        tex = LoadTextureFromImage(image);
+        UnloadImage(image);
+        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
     }
-
-    UpdateTexture(tex, s_uploadBuffer.data());
-    outWidth = width;
-    outHeight = height;
-    s_hasUploadedFrame = true;
+    UpdateTexture(tex, s_scratch.data());
+    if (hashImages)
+    {
+        const auto mix = [](uint32_t value)
+        {
+            value ^= value >> 16u;
+            value *= 0x7feb352du;
+            value ^= value >> 15u;
+            value *= 0x846ca68bu;
+            return value ^ (value >> 16u);
+        };
+        uint32_t sum = 0u;
+        uint32_t hashXor = 0u;
+        for (uint32_t i = 0u; i < width * height; ++i)
+        {
+            uint32_t pixel;
+            std::memcpy(&pixel, s_scratch.data() + static_cast<size_t>(i) * 4u, sizeof(pixel));
+            const uint32_t value = mix(pixel ^ mix(i + 1u));
+            sum += value;
+            hashXor ^= mix(value ^ 0x9e3779b9u);
+        }
+        diagnostic.contentHash = s_lastHash = static_cast<uint64_t>(sum) | (static_cast<uint64_t>(hashXor) << 32u);
+        diagnostic.width = width;
+        diagnostic.height = height;
+        diagnostic.hashValid = true;
+    }
+    outWidth = s_lastWidth = width;
+    outHeight = s_lastHeight = height;
 }
 
 PS2Runtime::PS2Runtime()
@@ -503,8 +628,8 @@ PS2Runtime::PS2Runtime()
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackFloor = ps2x::kernel_memory::kCallbackStackFloor;
+    m_asyncCallbackStackTop = ps2x::kernel_memory::kCallbackStackTop;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -537,8 +662,9 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
-            CloseAudioDevice();
+            m_audioBackend.stopAll();
             m_audioBackend.setAudioReady(false);
+            CloseAudioDevice();
         }
 #endif
         if (m_debugUiInitialized && m_debugUiShutdownCallback)
@@ -665,45 +791,65 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    ps2x::asyncvif::setGifProcessor([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+                                    {
+                                        if (!ps2x::asyncvif::submitGif(data, size))
+                                            m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    ps2x::asyncvif::setFbrstProvider([this]() -> uint32_t
+                                     {
+                                         R5900Context *context = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         return (context ? context : &m_cpuContext)->vu0_fbrst; });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     const bool onVuThread = ps2x::asyncvif::onWorker();
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!onVuThread)
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                             cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = onVuThread ? ps2x::asyncvif::currentFbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (cpuContext)
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    ps2x::asyncvif::setVu1Timing({[this]() -> uint64_t
+                                  { return m_eeScheduler ? m_eeScheduler->currentCycle() : 0u; },
+                                  [this]() -> uint64_t
+                                  { return m_vu1.state().cycles; },
+                                  [this](uint64_t cycles) -> uint64_t
+                                  { return m_eeScheduler ? m_eeScheduler->consumeCycles(cycles) : 0u; }});
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
+                                     const bool onVuThread = ps2x::asyncvif::onWorker();
+                                     R5900Context *cpuContext = nullptr;
+                                     if (!onVuThread)
                                      {
-                                         cpuContext = &m_cpuContext;
+                                         cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                         if (!cpuContext)
+                                             cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = onVuThread ? ps2x::asyncvif::currentFbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (cpuContext)
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -723,19 +869,34 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
-        if (!syncCoreSubsystems())
+#if defined(PLATFORM_VITA)
+        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+#else
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN);
+        if (ps2_host_display::headless)
+            SetConfigFlags(FLAG_WINDOW_HIDDEN);
+        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        if (ps2_host_display::startMaximized && !ps2_host_display::headless)
+            MaximizeWindow();
+        SetExitKey(KEY_NULL);
+        if (ps2_host_display::headless)
+        {
+            m_audioBackend.setAudioReady(false);
+        }
+        else
+        {
+            InitAudioDevice();
+            m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        }
+        GSSharedPresent::CaptureHostContext();
+#endif
+        const bool coreReady = syncCoreSubsystems();
+        GSSharedPresent::RestoreHostContext();
+        if (!coreReady)
         {
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
-#if defined(PLATFORM_VITA)
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
-#else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        InitAudioDevice();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
-#endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
         {
@@ -971,9 +1132,8 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackFloor = ps2x::kernel_memory::kCallbackStackFloor;
+        m_asyncCallbackStackTop = ps2x::kernel_memory::kCallbackStackTop;
     }
 
     LoadedModule module;
@@ -1132,6 +1292,11 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
     default:
         return "Unknown";
     }
+}
+
+void ps2xTraceSchedulerDispatch(R5900Context *ctx)
+{
+    pushBranchEvent(3u, 0u, ctx->pc, ctx, 0u);
 }
 
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
@@ -1322,6 +1487,15 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
             std::lock_guard<std::mutex> lock(s_missingFunctionLogMutex);
             std::cerr << oss.str() << std::endl;
         }
+        dumpBranchTrace();
+        if (const char *dumpPath = std::getenv("PS2X_DUMP_RAM_ON_MISSING"); dumpPath && *dumpPath && rdram)
+        {
+            if (FILE *file = std::fopen(dumpPath, "wb"))
+            {
+                std::fwrite(rdram, 1, PS2_RAM_SIZE, file);
+                std::fclose(file);
+            }
+        }
     }
 
     if (firstReport && policy == MissingFunctionPolicy::BreakOnce)
@@ -1363,6 +1537,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (!isCall)
     {
+        pushBranchEvent(2u, sourcePc, targetPc, ctx, 0u);
+        ++g_guestJumpSerial;
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
@@ -1372,7 +1548,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    RecompiledFunction targetFn = nullptr;
+    if (g_singleLookup)
+    {
+        uint32_t slot = 0u;
+        if (generatedFunctionTableSlot(targetPc, slot))
+            targetFn = g_ps2RecompiledFunctionTable[slot];
+    }
+    else if (hasFunction(targetPc))
+        targetFn = lookupFunction(targetPc);
+    if (!targetFn)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -1387,23 +1572,26 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         if (policy == MissingFunctionPolicy::ContinueToTarget)
         {
             ctx->pc = targetPc;
-            // if you need the app to keep open to open debug pannel change this to false
             return false;
         }
 
         return false;
     }
 
-    RecompiledFunction targetFn = lookupFunction(targetPc);
+    if (g_singleLookup)
+        pushDispatchPc(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t jumpSerial = g_guestJumpSerial;
+    pushBranchEvent(0u, sourcePc, targetPc, ctx, fallthroughPc);
     targetFn(rdram, ctx, this);
+    pushBranchEvent(1u, targetPc, ctx->pc, ctx, fallthroughPc);
 
-    if (isStopRequested() || ctx->pc == 0u)
+    if (m_eeScheduler->transferPending() || m_eeScheduler->unwinding() || isStopRequested() || ctx->pc == 0u)
     {
         return false;
     }
 
-    if (ctx->pc == entryPc)
+    if (ctx->pc == entryPc && jumpSerial == g_guestJumpSerial)
     {
         ctx->pc = fallthroughPc;
     }
@@ -1452,12 +1640,12 @@ void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_
     executeVU0Microprogram(rdram, ctx, address);
 }
 
-void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
+bool PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
 {
-    handleSyscall(rdram, ctx, 0);
+    return handleSyscall(rdram, ctx, 0);
 }
 
-void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId)
+bool PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId)
 {
     if (ctx->in_delay_slot)
     {
@@ -1469,13 +1657,12 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
                                    ? encodedSyscallId
                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
 
-    if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
+    EeScheduler::DeferredTransferScope deferTransfers(*m_eeScheduler);
+    if (!ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
     {
-        return;
+        ps2_syscalls::TODO(rdram, ctx, this, encodedSyscallId);
     }
-
-    // God help you
-    ps2_syscalls::TODO(rdram, ctx, this, encodedSyscallId);
+    return !m_eeScheduler->transferPending();
 }
 
 void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
@@ -2069,7 +2256,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
     try
     {
-        return m_memory.read128(vaddr);
+        return m_memory.read128(vaddr & ~0xFu);
     }
     catch (const std::exception &)
     {
@@ -2135,10 +2322,10 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
 {
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
-    ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
+    ps2TraceGuestWrite(rdram, vaddr & ~0xFu, 16u, _parts[0], _parts[1], "WRITE128", ctx);
     try
     {
-        m_memory.write128(vaddr, value);
+        m_memory.write128(vaddr & ~0xFu, value);
     }
     catch (const std::exception &)
     {
@@ -2218,12 +2405,7 @@ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
     const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
     const uint64_t waitTicks = std::max<uint64_t>(1u, ticks);
-    m_eeScheduler->waitVSync(currentTick + waitTicks - 1u,
-                             0,
-                             [resumePc](R5900Context &context)
-                             {
-                                 context.pc = resumePc;
-                             });
+    m_eeScheduler->waitVSyncResume(currentTick + waitTicks - 1u, 0, resumePc);
 }
 
 void PS2Runtime::addEeExitHandler(int threadId, uint32_t function, uint32_t argument)
@@ -2253,6 +2435,18 @@ void PS2Runtime::removeEeExitHandlers(int threadId)
 
 bool PS2Runtime::findEeSyscallOverride(uint32_t syscallNumber, uint32_t &handler) const
 {
+    const uint32_t presenceIndex = syscallNumber + 256u;
+    if (presenceIndex < 512u)
+    {
+        if ((m_eeSyscallOverridePresence[presenceIndex >> 6u].load(std::memory_order_acquire) & (1ull << (presenceIndex & 63u))) == 0u)
+        {
+            return false;
+        }
+    }
+    else if (m_eeSyscallOverridesOutOfRange.load(std::memory_order_acquire) == 0u)
+    {
+        return false;
+    }
     std::lock_guard lock(m_eeKernelStateMutex);
     const auto it = m_eeSyscallOverrides.find(syscallNumber);
     if (it == m_eeSyscallOverrides.end())
@@ -2278,6 +2472,26 @@ void PS2Runtime::setEeSyscallOverride(uint8_t *rdram, uint32_t syscallNumber, ui
     else
     {
         m_eeSyscallOverrides[syscallNumber] = handler;
+    }
+    const uint32_t presenceIndex = syscallNumber + 256u;
+    if (presenceIndex < 512u)
+    {
+        const uint64_t bit = 1ull << (presenceIndex & 63u);
+        if (handler == 0u)
+            m_eeSyscallOverridePresence[presenceIndex >> 6u].fetch_and(~bit, std::memory_order_acq_rel);
+        else
+            m_eeSyscallOverridePresence[presenceIndex >> 6u].fetch_or(bit, std::memory_order_acq_rel);
+    }
+    else
+    {
+        uint32_t outOfRange = 0u;
+        for (const auto &[number, value] : m_eeSyscallOverrides)
+        {
+            (void)value;
+            if (number + 256u >= 512u)
+                ++outOfRange;
+        }
+        m_eeSyscallOverridesOutOfRange.store(outOfRange, std::memory_order_release);
     }
     if (!rdram || address < 0 || address + 4 > kMirrorLimit)
     {
@@ -2357,16 +2571,17 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    Texture2D frameTex{};
+    ps2_host_display::updateWindowAspect();
 
     std::atomic<bool> gameThreadFinished{false};
+    ps2_host_input::setFieldCounter(&m_memory.gs().vsyncTick);
+    ps2_host_input::sample();
 
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ThreadPriority::RaiseCurrentThread(ThreadPriority::Level::Highest);
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -2385,9 +2600,52 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    ThreadPriority::RaiseCurrentThread(ThreadPriority::Level::AboveNormal);
+    bool restoreMaximized = false;
     uint64_t tick = 0;
+    std::ofstream frameTimes;
+    if (const char *path = std::getenv("PS2X_FRAME_TIMES"); path && *path)
+    {
+        frameTimes.open(path);
+        if (frameTimes)
+            frameTimes << "seconds,field,source_sequence,render_revision,new_source,interval_ms,submit_ms,swap_ms,shared,hash_valid,image_hash,image_changed\n";
+        else
+            std::cerr << "[gs-present] cannot write frame times: " << path << '\n';
+    }
+    using PresentClock = std::chrono::steady_clock;
+    const auto presentStart = PresentClock::now();
+    auto lastSwap = presentStart;
+    const bool tracingFrames = frameTimes.is_open() && frameTimes.good();
+    std::vector<uint64_t> screenshotFields;
+    if (const char *fields = std::getenv("PS2X_SCREENSHOT_FIELDS"))
+    {
+        std::istringstream input(fields);
+        std::string value;
+        while (std::getline(input, value, ','))
+            screenshotFields.push_back(std::strtoull(value.c_str(), nullptr, 10));
+        std::sort(screenshotFields.rbegin(), screenshotFields.rend());
+    }
+    uint64_t lastSource = 0u;
+    const char *hashSetting = std::getenv("PS2X_FRAME_HASH");
+    const bool hashImages = hashSetting && *hashSetting == '1';
+    uint64_t lastHash = 0u;
+    uint32_t lastHashWidth = 0u;
+    uint32_t lastHashHeight = 0u;
+    bool hadHash = false;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        if (IsWindowMinimized())
+        {
+            PollInputEvents();
+            ps2_host_input::sample();
+            if (WindowShouldClose())
+            {
+                requestStop();
+                break;
+            }
+            WaitTime(1.0 / 120.0);
+            continue;
+        }
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
             if ((tick % 120) == 0)
@@ -2420,31 +2678,123 @@ void PS2Runtime::run()
 
             }
         });
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        ps2_host_display::updateWindowAspect();
+        const auto submitStart = tracingFrames ? PresentClock::now() : presentStart;
+        uint32_t presentWidth = 0u;
+        uint32_t presentHeight = 0u;
+        GSSharedPresent::Frame sharedFrame;
+        UploadFrame(frameTex, this, presentWidth, presentHeight, hashImages, sharedFrame);
+        Texture2D displayTex = frameTex;
+        const bool shared = GSSharedPresent::Active();
+        if (shared)
+        {
+            sharedFrame = {};
+            displayTex = {};
+            presentWidth = presentHeight = 0u;
+            if (GSSharedPresent::Acquire(sharedFrame))
+            {
+                displayTex = Texture2D{sharedFrame.texture, static_cast<int>(sharedFrame.width),
+                                       static_cast<int>(sharedFrame.height), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                presentWidth = sharedFrame.width;
+                presentHeight = sharedFrame.height;
+            }
+        }
+        else
+        {
+            sharedFrame.width = presentWidth;
+            sharedFrame.height = presentHeight;
+        }
 
         BeginDrawing();
         ClearBackground(BLACK);
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
-            dstWidth,
-            dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        if (displayTex.id != 0 && presentWidth != 0u && presentHeight != 0u)
+        {
+            const float screenWidth = static_cast<float>(GetScreenWidth());
+            const float screenHeight = static_cast<float>(GetScreenHeight());
+            const float displayAspect = ps2_host_display::aspect();
+            float dstWidth = screenWidth;
+            float dstHeight = screenHeight;
+            if (!ps2_host_display::fitWindow.load(std::memory_order_relaxed))
+            {
+                dstHeight = screenWidth / displayAspect;
+                if (dstHeight > screenHeight)
+                {
+                    dstHeight = screenHeight;
+                    dstWidth = screenHeight * displayAspect;
+                }
+            }
+            const Rectangle srcRect{0.0f, 0.0f, static_cast<float>(presentWidth), static_cast<float>(presentHeight)};
+            const Rectangle dstRect{(screenWidth - dstWidth) * 0.5f, (screenHeight - dstHeight) * 0.5f, dstWidth, dstHeight};
+            DrawTexturePro(displayTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        }
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
+        {
+            std::string stateText;
+            float stateAlpha = 0.0f;
+            if (ps2x::savestate::overlayMessage(stateText, stateAlpha))
+            {
+                const int fontSize = std::max(18, GetScreenHeight() / 30);
+                const int width = MeasureText(stateText.c_str(), fontSize);
+                DrawRectangle(12, 12, width + 24, fontSize + 16, Fade(BLACK, 0.6f * stateAlpha));
+                DrawText(stateText.c_str(), 24, 20, fontSize, Fade(RAYWHITE, stateAlpha));
+            }
+        }
+        if (!screenshotFields.empty() && eeScheduler().currentVSyncTick() >= screenshotFields.back())
+        {
+            if (const char *directory = std::getenv("PS2X_SCREENSHOT_DIR"))
+            {
+                const auto path = std::filesystem::path(directory) / ("field-" + std::to_string(eeScheduler().currentVSyncTick()) + ".png");
+                rlDrawRenderBatchActive();
+                const Image screen = LoadImageFromScreen();
+                ExportImage(screen, path.string().c_str());
+                UnloadImage(screen);
+            }
+            screenshotFields.pop_back();
+        }
+        const auto swapStart = tracingFrames ? PresentClock::now() : presentStart;
         EndDrawing();
+        if (tracingFrames)
+        {
+            const auto now = PresentClock::now();
+            const uint64_t field = eeScheduler().currentVSyncTick();
+            const uint64_t source = shared ? sharedFrame.sequence : field;
+            frameTimes << std::chrono::duration<double>(now - presentStart).count() << ',' << field << ','
+                       << source << ',' << sharedFrame.renderSequence << ','
+                       << (shared ? static_cast<int>(source != 0u && source != lastSource) : -1) << ','
+                       << std::chrono::duration<double, std::milli>(now - lastSwap).count() << ','
+                       << std::chrono::duration<double, std::milli>(swapStart - submitStart).count() << ','
+                       << std::chrono::duration<double, std::milli>(now - swapStart).count() << ',' << shared;
+            const bool imageChanged = sharedFrame.hashValid && (!hadHash || sharedFrame.contentHash != lastHash ||
+                                      sharedFrame.width != lastHashWidth || sharedFrame.height != lastHashHeight);
+            frameTimes << ',' << sharedFrame.hashValid << ',' << sharedFrame.contentHash << ','
+                       << (sharedFrame.hashValid ? static_cast<int>(imageChanged) : -1) << '\n';
+            hadHash = sharedFrame.hashValid;
+            lastHash = sharedFrame.contentHash;
+            lastHashWidth = sharedFrame.width;
+            lastHashHeight = sharedFrame.height;
+            lastSource = source;
+            lastSwap = now;
+        }
+#if !defined(PLATFORM_VITA)
+        if (IsKeyPressed(KEY_F11))
+        {
+            ps2_host_input::releaseMouse();
+            const bool leavingFullscreen = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
+            if (!leavingFullscreen)
+                restoreMaximized = IsWindowMaximized();
+            ToggleBorderlessWindowed();
+            if (leavingFullscreen && restoreMaximized)
+                MaximizeWindow();
+        }
+#endif
+        ps2_host_input::sample();
+        if (IsKeyPressed(KEY_F5))
+            ps2x::savestate::requestQuickSave();
+        if (IsKeyPressed(KEY_F9))
+            ps2x::savestate::requestQuickLoad();
 
         if (WindowShouldClose())
         {
@@ -2465,7 +2815,10 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
+    if (frameTex.id != 0)
+        UnloadTexture(frameTex);
+    GSSharedPresent::ShutdownHost();
+    ps2_host_input::releaseMouse();
     CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");

@@ -1,10 +1,13 @@
 #pragma once
 
 #include "iop_cpu.h"
+#include "ps2x/state_io.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -67,6 +70,31 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        [[nodiscard]] std::vector<std::string> describeThreads() const;
+
+        [[nodiscard]] int createModuleStartThread(uint32_t entry, uint32_t gp, uint32_t a0, uint32_t a1, uint32_t priority, uint32_t stackSize);
+        [[nodiscard]] bool threadFinished(int id) const;
+        uint32_t releaseModuleStartThread(int id);
+
+        [[nodiscard]] int createCallThread(const IopCpuState &cpu, uint32_t priority);
+        [[nodiscard]] IopThread *beginThread(int id);
+        [[nodiscard]] IopThread *findThread(int id);
+        [[nodiscard]] uint32_t threadPriority(int id, uint32_t fallback) const;
+        void releaseThread(int id);
+        [[nodiscard]] IopThread *currentThread() const noexcept { return m_currentThread; }
+        void setCurrentThread(IopThread *thread) noexcept { m_currentThread = thread; }
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            int current = m_currentThread ? m_currentThread->id : 0;
+            ps2x::state::fields(ar, m_threads, m_semaphores, m_eventFlags, m_nextThreadId, m_nextSemaphoreId, m_nextEventFlagId, current);
+            if constexpr (Ar::kLoading)
+            {
+                const auto it = m_threads.find(current);
+                m_currentThread = it != m_threads.end() ? &it->second : nullptr;
+            }
+        }
 
     private:
         struct Semaphore
@@ -90,6 +118,7 @@ namespace ps2x::iop::detail
         void wakeOneSemaphore(int id);
         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
         void wakeEventWaiters(EventFlag &event);
+        void yieldIfHigherPriorityReady(IopCpuState &cpu);
 
         IopMemory &m_memory;
         std::map<int, IopThread> m_threads;
@@ -98,6 +127,9 @@ namespace ps2x::iop::detail
         uint32_t m_nextThreadId = 1;
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
+        uint32_t m_nextCallThreadId = kFirstCallThreadId;
         IopThread *m_currentThread = nullptr;
+
+        static constexpr uint32_t kFirstCallThreadId = 0x40000000u;
     };
 }

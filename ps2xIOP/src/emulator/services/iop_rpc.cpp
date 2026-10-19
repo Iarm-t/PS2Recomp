@@ -13,6 +13,11 @@
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        constexpr uint32_t kDefaultServerPriority = 0x40u;
+    }
+
     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
         : m_host(host), m_memory(memory), m_kernel(kernel)
     {
@@ -23,6 +28,74 @@ namespace ps2x::iop::detail
         m_servers.clear();
         m_nextDmaId = 1u;
         m_sifInitialized = false;
+        m_dmaCallback.reset();
+    }
+
+    uint32_t IopRpcBridge::setDma(uint32_t descriptorAddress, uint32_t descriptorCount, uint32_t &bytes)
+    {
+        constexpr uint32_t kDescriptorSize = 16u;
+        constexpr uint32_t kMaxDescriptors = 32u;
+        bytes = 0u;
+        if (descriptorAddress == 0u || descriptorCount == 0u || descriptorCount > kMaxDescriptors)
+            return 0u;
+
+        struct PendingTransfer
+        {
+            uint32_t source = 0u;
+            uint32_t destination = 0u;
+            uint32_t size = 0u;
+        };
+
+        std::array<uint32_t, kMaxDescriptors * 4u> descriptorWords{};
+        const size_t descriptorBytes = static_cast<size_t>(descriptorCount) * kDescriptorSize;
+        if (!m_memory.readRam(descriptorAddress, descriptorWords.data(), descriptorBytes))
+            return 0u;
+
+        std::array<PendingTransfer, kMaxDescriptors> pending{};
+        uint32_t pendingCount = 0u;
+        uint32_t largestTransfer = 0u;
+        for (uint32_t i = 0u; i < descriptorCount; ++i)
+        {
+            const uint32_t source = descriptorWords[i * 4u + 0u];
+            const uint32_t destination = descriptorWords[i * 4u + 1u];
+            const int32_t signedSize = static_cast<int32_t>(descriptorWords[i * 4u + 2u]);
+            if (signedSize <= 0)
+                continue;
+
+            const uint32_t size = static_cast<uint32_t>(signedSize);
+            if (!m_memory.ownsRamRange(source, size))
+                return 0u;
+            pending[pendingCount++] = {source, destination, size};
+            largestTransfer = std::max(largestTransfer, size);
+        }
+
+        std::vector<uint8_t> scratch(largestTransfer);
+        for (uint32_t i = 0u; i < pendingCount; ++i)
+        {
+            if (!m_host.readGuest(pending[i].destination, scratch.data(), pending[i].size))
+                return 0u;
+        }
+
+        for (uint32_t i = 0u; i < pendingCount; ++i)
+        {
+            const PendingTransfer &transfer = pending[i];
+            if (!m_memory.readRam(transfer.source, scratch.data(), transfer.size) ||
+                !m_host.writeGuest(transfer.destination, scratch.data(), transfer.size))
+                return 0u;
+            bytes += transfer.size;
+        }
+
+        const uint32_t dmaId = m_nextDmaId++;
+        if (m_nextDmaId == 0u || m_nextDmaId > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+            m_nextDmaId = 1u;
+        return dmaId;
+    }
+
+    std::optional<IopRpcBridge::DmaCallback> IopRpcBridge::takeDmaCallback() noexcept
+    {
+        std::optional<DmaCallback> result = m_dmaCallback;
+        m_dmaCallback.reset();
+        return result;
     }
 
     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
@@ -40,83 +113,8 @@ namespace ps2x::iop::detail
             return true;
         case 7: // sceSifSetDma
         {
-            constexpr uint32_t kDescriptorSize = 16u;
-            constexpr uint32_t kMaxDescriptors = 32u;
-            const uint32_t descriptorAddress = cpu.gpr[4];
-            const uint32_t descriptorCount = cpu.gpr[5];
-            if (descriptorAddress == 0u || descriptorCount == 0u || descriptorCount > kMaxDescriptors)
-            {
-                setV0(0u);
-                return true;
-            }
-
-            struct PendingTransfer
-            {
-                uint32_t source = 0u;
-                uint32_t destination = 0u;
-                uint32_t size = 0u;
-            };
-
-            std::array<uint32_t, kMaxDescriptors * 4u> descriptorWords{};
-            const size_t descriptorBytes = static_cast<size_t>(descriptorCount) * kDescriptorSize;
-            if (!m_memory.readRam(descriptorAddress, descriptorWords.data(), descriptorBytes))
-            {
-                setV0(0u);
-                return true;
-            }
-
-            std::array<PendingTransfer, kMaxDescriptors> pending{};
-            uint32_t pendingCount = 0u;
-            uint32_t largestTransfer = 0u;
-            for (uint32_t i = 0u; i < descriptorCount; ++i)
-            {
-                const uint32_t source = descriptorWords[i * 4u + 0u];
-                const uint32_t destination = descriptorWords[i * 4u + 1u];
-                const int32_t signedSize = static_cast<int32_t>(descriptorWords[i * 4u + 2u]);
-                if (signedSize <= 0)
-                    continue;
-
-                const uint32_t size = static_cast<uint32_t>(signedSize);
-                if (!m_memory.ownsRamRange(source, size))
-                {
-                    setV0(0u);
-                    return true;
-                }
-                pending[pendingCount++] = {source, destination, size};
-                largestTransfer = std::max(largestTransfer, size);
-            }
-
-            // IOP-side sceSifSetDma sends IOP RAM to the EE. Validate all EE
-            // destinations before committing any write so a bad chain cannot
-            // partially update guest memory, but maybe we could skip this check if we trust the EE-side SIF driver to validate the chain ?!
-            // TODO check later
-            std::vector<uint8_t> scratch(largestTransfer);
-            for (uint32_t i = 0u; i < pendingCount; ++i)
-            {
-                const PendingTransfer &transfer = pending[i];
-                if (!m_host.readGuest(transfer.destination, scratch.data(), transfer.size))
-                {
-                    setV0(0u);
-                    return true;
-                }
-            }
-
-            for (uint32_t i = 0u; i < pendingCount; ++i)
-            {
-                const PendingTransfer &transfer = pending[i];
-                if (!m_memory.readRam(transfer.source, scratch.data(), transfer.size) || !m_host.writeGuest(transfer.destination, scratch.data(), transfer.size))
-                {
-                    setV0(0u);
-                    return true;
-                }
-            }
-
-            const uint32_t dmaId = m_nextDmaId++;
-            if (m_nextDmaId == 0u || m_nextDmaId > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
-            {
-                m_nextDmaId = 1u;
-            }
-            setV0(dmaId);
+            uint32_t bytes = 0u;
+            setV0(setDma(cpu.gpr[4], cpu.gpr[5], bytes));
             return true;
         }
         case 8: // sceSifDmaStat
@@ -125,6 +123,15 @@ namespace ps2x::iop::detail
         case 29: // sceSifCheckInit
             setV0(m_sifInitialized ? 1u : 0u);
             return true;
+        case 32:
+        {
+            uint32_t bytes = 0u;
+            const uint32_t dmaId = setDma(cpu.gpr[4], cpu.gpr[5], bytes);
+            if (dmaId != 0u && cpu.gpr[6] != 0u)
+                m_dmaCallback = DmaCallback{cpu.gpr[6], cpu.gpr[7], cpu.gpr[28], bytes};
+            setV0(dmaId);
+            return true;
+        }
         default:
             setV0(0u);
             return true;
@@ -234,6 +241,8 @@ namespace ps2x::iop::detail
             setV0(0);
             return true;
         case 19: // SetRpcQueue
+            if (cpu.gpr[4] != 0u && m_memory.ownsRamRange(cpu.gpr[4], 4u))
+                m_memory.write32(cpu.gpr[4], cpu.gpr[5]);
             setV0(cpu.gpr[4]);
             return true;
         case 20:
@@ -292,12 +301,16 @@ namespace ps2x::iop::detail
             }
         }
 
-        uint32_t returnPointer = executor.executeGuestFunction(server.function,
-                                                               request.function,
-                                                               server.buffer,
-                                                               request.send.size,
-                                                               0u,
-                                                               server.gp);
+        uint32_t priority = kDefaultServerPriority;
+        if (server.queue != 0u && m_memory.ownsRamRange(server.queue, 4u))
+            priority = m_kernel.threadPriority(static_cast<int>(m_memory.read32(server.queue)), kDefaultServerPriority);
+        uint32_t returnPointer = executor.executeServerFunction(server.function,
+                                                                request.function,
+                                                                server.buffer,
+                                                                request.send.size,
+                                                                0u,
+                                                                server.gp,
+                                                                priority);
         if (returnPointer == 0u)
             returnPointer = server.buffer;
         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)

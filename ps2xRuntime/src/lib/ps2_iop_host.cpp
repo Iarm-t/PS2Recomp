@@ -1,9 +1,11 @@
 #include "ps2_iop_host.h"
 
+#include "ps2_host_input.h"
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_cd_image.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
 
@@ -267,6 +269,16 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             receive.size);
 }
 
+void PS2IopHostAdapter::submitAudio(std::span<const int16_t> samples)
+{
+    m_runtime.audioBackend().submitPcm(samples);
+}
+
+void PS2IopHostAdapter::resetAudio()
+{
+    m_runtime.audioBackend().resetPcm();
+}
+
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
 {
     const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
@@ -286,8 +298,21 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
     }
 }
 
+namespace
+{
+    constexpr std::string_view kCdImagePathPrefix = "<cdimage>:";
+}
+
 std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const
 {
+    const ps2x::iop::ParsedPs2Path parsed = ps2x::iop::parsePs2Path(path);
+    if (PS2CdImage::Entry entry{}; parsed && parsed.device == ps2x::iop::Ps2PathDevice::Cdrom &&
+                                   PS2CdImage::instance().ensureOpenFromIoPaths() &&
+                                   PS2CdImage::instance().find(parsed.path, entry) && !entry.directory)
+    {
+        return std::string(kCdImagePathPrefix) + std::to_string(entry.lba) + ":" + std::to_string(entry.size);
+    }
+
     const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
     const PS2VfsMounts mounts{paths.hostRoot, paths.cdRoot, paths.mcRoot};
     std::filesystem::path hostPath;
@@ -301,6 +326,28 @@ uint64_t PS2IopHostAdapter::openHostFile(std::string_view path)
     if (path.empty())
     {
         return 0u;
+    }
+
+    if (path.substr(0, kCdImagePathPrefix.size()) == kCdImagePathPrefix)
+    {
+        const std::string spec(path.substr(kCdImagePathPrefix.size()));
+        const size_t colon = spec.find(':');
+        if (colon == std::string::npos)
+        {
+            return 0u;
+        }
+        HostFile file;
+        file.cdImage = true;
+        file.cdImageOffset = std::stoull(spec.substr(0, colon)) * PS2CdImage::kSectorSize;
+        file.size = std::stoull(spec.substr(colon + 1));
+        std::lock_guard<std::mutex> lock(m_hostFileMutex);
+        uint64_t handle = m_nextHostFileHandle++;
+        if (handle == 0u)
+        {
+            handle = m_nextHostFileHandle++;
+        }
+        m_hostFiles.emplace(handle, file);
+        return handle;
     }
 
     const std::filesystem::path hostPath{std::string(path)};
@@ -337,7 +384,7 @@ bool PS2IopHostAdapter::hostFileSize(uint64_t handle, uint64_t &size) const
     size = 0u;
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
     const auto it = m_hostFiles.find(handle);
-    if (it == m_hostFiles.end() || !it->second.stream)
+    if (it == m_hostFiles.end() || (!it->second.stream && !it->second.cdImage))
     {
         return false;
     }
@@ -359,6 +406,17 @@ bool PS2IopHostAdapter::readHostFile(uint64_t handle,
 
     std::lock_guard<std::mutex> lock(m_hostFileMutex);
     const auto it = m_hostFiles.find(handle);
+    if (it != m_hostFiles.end() && it->second.cdImage)
+    {
+        const uint64_t available = offset < it->second.size ? it->second.size - offset : 0u;
+        const size_t count = static_cast<size_t>(std::min<uint64_t>(size, available));
+        if (count != 0u && !PS2CdImage::instance().read(it->second.cdImageOffset + offset, destination, count))
+        {
+            return false;
+        }
+        bytesRead = count;
+        return true;
+    }
     if (it == m_hostFiles.end() || !it->second.stream)
     {
         return false;
@@ -515,6 +573,12 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                          commandId,
                                          packet,
                                          packetSize);
+}
+
+bool PS2IopHostAdapter::readPad(uint32_t port, ps2x::iop::PadInputState &state)
+{
+    state = ps2_host_input::padState(port);
+    return state.connected;
 }
 
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)

@@ -1,11 +1,15 @@
+#include "runtime/ps2_async_vif.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -44,6 +48,12 @@ namespace
     inline bool isIoRegister(uint32_t addr)
     {
         return Ps2AddressInRange(addr, PS2_IO_BASE, PS2_IO_SIZE);
+    }
+
+    inline bool isAsyncVifRegister(uint32_t addr)
+    {
+        return (addr >= 0x10003000u && addr < 0x10003100u) || (addr >= 0x10003C00u && addr < 0x10004000u) ||
+               (addr >= 0x10005000u && addr < 0x10007000u);
     }
 
     inline uint64_t *gsRegPtr(GSRegisters &gs, uint32_t addr)
@@ -100,14 +110,14 @@ namespace
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
-    // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
-    // write-one-to-clear; everything else is a plain merge. Uses compare_exchange
+    // dword) of the GS CSR register. Bits 0..4 of the low dword (SIGNAL/FINISH/
+    // HSINT/VSINT/EDWINT) are write-one-to-clear; everything else is a plain merge. Uses compare_exchange
     // so the whole read-modify-write is a single atomic step -- this register is
     // also touched by the vsync worker (FIELD bit) and the GIF (SIGNAL/FINISH) on
     // other threads, so a load-then-store here would race with them.
     inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
     {
-        constexpr uint32_t kW1cMask = 0x3u;
+        constexpr uint32_t kW1cMask = 0x1Fu;
         uint64_t expected = csr.load();
         uint64_t desired;
         do
@@ -127,11 +137,11 @@ namespace
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
-    // Same as writeCsrHalf but for a full 64-bit CSR write (bits 0..1 are still
+    // Same as writeCsrHalf but for a full 64-bit CSR write (bits 0..4 are still
     // write-one-to-clear against the current value).
     inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
     {
-        constexpr uint64_t kW1cMask = 0x3ull;
+        constexpr uint64_t kW1cMask = 0x1Full;
         uint64_t expected = csr.load();
         uint64_t desired;
         do
@@ -228,6 +238,29 @@ namespace
         return nreg == 0u ? 16u : nreg;
     }
 
+    constexpr uint32_t kEeTimerBacklogLimit = 1u << 20;
+
+    struct EeTimerBacklog
+    {
+        std::array<uint32_t, 4> overflows{};
+        std::array<uint32_t, 4> compares{};
+        uint32_t undelivered = 0u;
+    };
+
+    std::mutex g_eeTimerBacklogMutex;
+    std::unordered_map<const void *, EeTimerBacklog> g_eeTimerBacklogs;
+
+    EeTimerBacklog &eeTimerBacklog(const void *memory)
+    {
+        std::lock_guard<std::mutex> lock(g_eeTimerBacklogMutex);
+        return g_eeTimerBacklogs[memory];
+    }
+
+    uint32_t addBacklog(uint32_t pending, uint64_t events)
+    {
+        return static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(pending) + events, kEeTimerBacklogLimit));
+    }
+
 }
 
 // Helpers for GS VRAM addressing (PSMCT32 path).
@@ -246,6 +279,7 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    ps2x::asyncvif::stop(*this);
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -401,7 +435,10 @@ bool PS2Memory::initialize(size_t ramSize)
 
 void PS2Memory::resetEeTimers() noexcept
 {
+    eeTimerBacklog(this) = {};
     m_eeTimers = {};
+    m_eeTimerPendingCycles = 0u;
+    m_eeTimerEventBudget = computeCyclesUntilNextEeTimerInterrupt();
 }
 
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
@@ -411,18 +448,38 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         return 0u;
     }
 
-    constexpr uint32_t kGifStat = 0x10003020u;
-    constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
+    if (m_gifStatWritten)
+    {
+        constexpr uint32_t kGifStat = 0x10003020u;
+        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+        auto gifStatIt = m_ioRegisters.find(kGifStat);
+        if (gifStatIt != m_ioRegisters.end())
+            gifStatIt->second &= ~kGifFqcMask;
+        m_gifStatWritten = false;
+    }
 
-    uint32_t interruptMask = 0u;
+    m_eeTimerPendingCycles += eeCycles;
+    if (m_eeTimerPendingCycles < m_eeTimerEventBudget)
+    {
+        return 0u;
+    }
+    return flushEeTimers();
+}
+
+uint32_t PS2Memory::flushEeTimers() noexcept
+{
+    const uint64_t eeCycles = m_eeTimerPendingCycles;
+    m_eeTimerPendingCycles = 0u;
+    EeTimerBacklog &backlog = eeTimerBacklog(this);
+    uint32_t interruptMask = backlog.undelivered;
+    backlog.undelivered = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
         EeTimer &timer = m_eeTimers[index];
         if ((timer.mode & kEeTimerModeCue) == 0u)
         {
+            backlog.overflows[index] = 0u;
+            backlog.compares[index] = 0u;
             continue;
         }
 
@@ -444,10 +501,14 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         const bool zeroReturn = (timer.mode & kEeTimerModeZret) != 0u;
         const bool compareReached = ticks >= compareDistance;
         bool overflowReached = false;
+        const uint64_t comparePeriod = zeroReturn && compare != 0u ? compare : 0x10000ull;
+        const uint64_t compareEvents = compareReached ? 1u + (ticks - compareDistance) / comparePeriod : 0u;
+        uint64_t overflowEvents = 0u;
 
         if (zeroReturn)
         {
             overflowReached = ticks >= overflowDistance && overflowDistance <= compareDistance;
+            overflowEvents = overflowReached ? (compare == 0u ? 1u + (ticks - overflowDistance) / 0x10000ull : 1u) : 0u;
             if (compareReached)
             {
                 const uint64_t remaining = ticks - compareDistance;
@@ -463,25 +524,52 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         else
         {
             overflowReached = ticks >= overflowDistance;
+            overflowEvents = (static_cast<uint64_t>(oldCount) + ticks) >> 16u;
             timer.count = static_cast<uint32_t>((oldCount + ticks) & 0xFFFFu);
         }
 
-        if (compareReached && (timer.mode & kEeTimerModeCmpe) != 0u && (timer.mode & kEeTimerModeEquf) == 0u)
+        if (compareEvents != 0u && (timer.mode & kEeTimerModeCmpe) != 0u)
         {
-            timer.mode |= kEeTimerModeEquf;
-            interruptMask |= 1u << index;
+            uint64_t missed = compareEvents;
+            if ((timer.mode & kEeTimerModeEquf) == 0u)
+            {
+                timer.mode |= kEeTimerModeEquf;
+                interruptMask |= 1u << index;
+                --missed;
+            }
+            backlog.compares[index] = addBacklog(backlog.compares[index], missed);
         }
-        if (overflowReached && (timer.mode & kEeTimerModeOvfe) != 0u && (timer.mode & kEeTimerModeOvff) == 0u)
+        if (overflowEvents != 0u && (timer.mode & kEeTimerModeOvfe) != 0u)
         {
-            timer.mode |= kEeTimerModeOvff;
-            interruptMask |= 1u << index;
+            uint64_t missed = overflowEvents;
+            if ((timer.mode & kEeTimerModeOvff) == 0u)
+            {
+                timer.mode |= kEeTimerModeOvff;
+                interruptMask |= 1u << index;
+                --missed;
+            }
+            backlog.overflows[index] = addBacklog(backlog.overflows[index], missed);
         }
     }
+    m_eeTimerEventBudget = computeCyclesUntilNextEeTimerInterrupt();
     return interruptMask;
 }
 
 uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
 {
+    if (m_eeTimerEventBudget == std::numeric_limits<uint64_t>::max())
+    {
+        return m_eeTimerEventBudget;
+    }
+    return m_eeTimerEventBudget - m_eeTimerPendingCycles;
+}
+
+uint64_t PS2Memory::computeCyclesUntilNextEeTimerInterrupt() const noexcept
+{
+    if (eeTimerBacklog(this).undelivered != 0u)
+    {
+        return 0u;
+    }
     uint64_t nearest = std::numeric_limits<uint64_t>::max();
     for (const EeTimer &timer : m_eeTimers)
     {
@@ -534,6 +622,8 @@ uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offs
 
 const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const
 {
+    if (physAddr >= PS2_VU1_CODE_BASE && physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE)
+        ps2x::asyncvif::sync(const_cast<PS2Memory &>(*this));
     auto mapRange = [&](uint32_t base, uint32_t rangeSize, const uint8_t *ptr) -> const uint8_t *
     {
         if (!ptr || physAddr < base)
@@ -744,6 +834,7 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        ps2x::asyncvif::sync(*this);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -792,6 +883,7 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        ps2x::asyncvif::sync(*this);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -953,6 +1045,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        ps2x::asyncvif::sync(*this);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -980,7 +1073,8 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     else if (physAddr < PS2_RAM_SIZE)
     {
         // Check if this might be code modification
-        markModified(address, 4);
+        if (!m_codeRegions.empty())
+            markModified(address, 4);
 
         storeScalar<uint32_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write32 rdram", address);
     }
@@ -1013,6 +1107,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
+        ps2x::asyncvif::sync(*this);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -1036,7 +1131,8 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(address, 8);
+        if (!m_codeRegions.empty())
+            markModified(address, 8);
         storeScalar<uint64_t>(m_rdram, physAddr, PS2_RAM_SIZE, value, "write64 rdram", address);
     }
     else
@@ -1081,6 +1177,14 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     {
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+        if (ps2x::asyncvif::active(*this))
+        {
+            std::vector<ps2x::asyncvif::Item> items(1);
+            items[0].kind = ps2x::asyncvif::ItemKind::Vif1;
+            items[0].data.assign(fifoData, fifoData + sizeof(fifoData));
+            ps2x::asyncvif::enqueue(*this, std::move(items));
+            return;
+        }
         processVIF1Data(fifoData, sizeof(fifoData));
         return;
     }
@@ -1092,7 +1196,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
     else if (physAddr < PS2_RAM_SIZE)
     {
-        markModified(address, 16);
+        if (!m_codeRegions.empty())
+            markModified(address, 16);
         inRange(physAddr, sizeof(__m128i), PS2_RAM_SIZE, "write128 rdram", address);
         _mm_storeu_si128(reinterpret_cast<__m128i *>(&m_rdram[physAddr]), value);
     }
@@ -1124,10 +1229,19 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (isAsyncVifRegister(address))
+        ps2x::asyncvif::sync(*this);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        EeTimerBacklog &backlog = eeTimerBacklog(this);
+        backlog.undelivered |= flushEeTimers();
+        struct BudgetRefresh
+        {
+            PS2Memory &memory;
+            ~BudgetRefresh() { memory.m_eeTimerEventBudget = memory.computeCyclesUntilNextEeTimerInterrupt(); }
+        } refresh{*this};
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -1143,6 +1257,26 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             if (((previousMode ^ timer.mode) & (kEeTimerModeClksMask | kEeTimerModeCue)) != 0u)
             {
                 timer.clockRemainder = 0u;
+            }
+            if ((timer.mode & kEeTimerModeCue) == 0u || (timer.mode & kEeTimerModeOvfe) == 0u)
+            {
+                backlog.overflows[timerIndex] = 0u;
+            }
+            if ((timer.mode & kEeTimerModeCue) == 0u || (timer.mode & kEeTimerModeCmpe) == 0u)
+            {
+                backlog.compares[timerIndex] = 0u;
+            }
+            if ((timer.mode & kEeTimerModeOvff) == 0u && backlog.overflows[timerIndex] != 0u)
+            {
+                --backlog.overflows[timerIndex];
+                timer.mode |= kEeTimerModeOvff;
+                backlog.undelivered |= 1u << timerIndex;
+            }
+            if ((timer.mode & kEeTimerModeEquf) == 0u && backlog.compares[timerIndex] != 0u)
+            {
+                --backlog.compares[timerIndex];
+                timer.mode |= kEeTimerModeEquf;
+                backlog.undelivered |= 1u << timerIndex;
             }
             break;
         }
@@ -1160,6 +1294,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
+        ps2x::asyncvif::sync(*this);
         // NB: unreachable from write8/16/32/64 today since those all funnel IO
         // register writes through addresses in PS2_IO_BASE's range, which is
         // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
@@ -1217,6 +1352,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     }
 
     m_ioRegisters[address] = value;
+    if (address == 0x10003020u)
+    {
+        m_gifStatWritten = true;
+    }
 
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
@@ -1305,6 +1444,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            if (channelBase == 0x10009000u)
+                ps2x::asyncvif::vu1Kick();
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
@@ -1344,8 +1485,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
-                    std::vector<uint8_t> chainBuf;
+                    const int kMaxChainTags = 1 << 20;
+                    static thread_local size_t chainSizeHint = 0u;
+                    std::vector<uint8_t> chainBuf = ps2x::asyncvif::takeBuffer();
+                    chainBuf.clear();
+                    chainBuf.reserve(chainSizeHint);
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1521,6 +1665,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                     }
 
+                    if (tagsProcessed >= kMaxChainTags)
+                    {
+                        std::fprintf(stderr, "[dma] chain on 0x%08x stopped after %d tags at 0x%08x\n", channelBase, tagsProcessed, tagAddr);
+                        std::fflush(stderr);
+                    }
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;
@@ -1528,6 +1677,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
 
+                    chainSizeHint = std::max(chainSizeHint, chainBuf.size());
                     if (!chainBuf.empty())
                     {
                         PendingTransfer pt;
@@ -1662,6 +1812,16 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
 
 void PS2Memory::processPendingTransfers()
 {
+    const bool asyncVif = ps2x::asyncvif::active(*this);
+    std::vector<ps2x::asyncvif::Item> asyncItems;
+    auto asyncCopy = [&](ps2x::asyncvif::ItemKind kind, const uint8_t *data, uint32_t size)
+    {
+        ps2x::asyncvif::Item item;
+        item.kind = kind;
+        item.data = ps2x::asyncvif::takeBuffer();
+        item.data.assign(data, data + size);
+        asyncItems.push_back(std::move(item));
+    };
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint32_t observedGifQwc = 0u;
     for (const auto &transfer : m_pendingGifTransfers)
@@ -1677,6 +1837,7 @@ void PS2Memory::processPendingTransfers()
         constexpr uint32_t kGifFqcMask = 0x1F000000u;
         uint32_t &gifStat = m_ioRegisters[kGifStat];
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        m_gifStatWritten = true;
     }
 
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
@@ -1686,7 +1847,15 @@ void PS2Memory::processPendingTransfers()
         {
             m_seenGifCopy = true;
             m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-            submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
+            if (asyncVif)
+            {
+                ps2x::asyncvif::Item item;
+                item.kind = ps2x::asyncvif::ItemKind::GifPath3;
+                item.data = std::move(p.chainData);
+                asyncItems.push_back(std::move(item));
+            }
+            else
+                submitGifPacket(GifPathId::Path3, p.chainData.data(), static_cast<uint32_t>(p.chainData.size()), false);
         }
         else if (p.qwc > 0)
         {
@@ -1715,7 +1884,10 @@ void PS2Memory::processPendingTransfers()
                         break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, chunk, false);
+                    if (asyncVif)
+                        asyncCopy(ps2x::asyncvif::ItemKind::GifPath3, m_scratchpad + srcPhys, chunk);
+                    else
+                        submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, chunk, false);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -1734,7 +1906,10 @@ void PS2Memory::processPendingTransfers()
                         break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
+                    if (asyncVif)
+                        asyncCopy(ps2x::asyncvif::ItemKind::GifPath3, m_rdram + srcPhys, chunk);
+                    else
+                        submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -1806,7 +1981,15 @@ void PS2Memory::processPendingTransfers()
     {
         if (!p.chainData.empty())
         {
-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            if (asyncVif)
+            {
+                ps2x::asyncvif::Item item;
+                item.kind = ps2x::asyncvif::ItemKind::Vif1;
+                item.data = std::move(p.chainData);
+                asyncItems.push_back(std::move(item));
+            }
+            else
+                processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
         }
         else if (p.qwc > 0)
         {
@@ -1833,7 +2016,10 @@ void PS2Memory::processPendingTransfers()
                         chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
                     if (chunk == 0)
                         break;
-                    processVIF1Data(m_scratchpad + srcPhys, chunk);
+                    if (asyncVif)
+                        asyncCopy(ps2x::asyncvif::ItemKind::Vif1, m_scratchpad + srcPhys, chunk);
+                    else
+                        processVIF1Data(m_scratchpad + srcPhys, chunk);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -1850,7 +2036,10 @@ void PS2Memory::processPendingTransfers()
                         chunk = PS2_RAM_SIZE - srcPhys;
                     if (chunk == 0)
                         break;
-                    processVIF1Data(srcPhys, chunk);
+                    if (asyncVif)
+                        asyncCopy(ps2x::asyncvif::ItemKind::Vif1, m_rdram + srcPhys, chunk);
+                    else
+                        processVIF1Data(srcPhys, chunk);
                     bytesLeft -= chunk;
                     srcPhys += chunk;
                 }
@@ -1859,7 +2048,9 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter)
+    if (asyncVif)
+        ps2x::asyncvif::enqueue(*this, std::move(asyncItems));
+    else if (m_gifArbiter)
         m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
@@ -1958,6 +2149,8 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         flushMaskedPath3Packets(false);
     }
 
+    if (m_gifArbiter && drainImmediately && m_gifArbiter->empty() && ps2x::asyncvif::submitGif(data, sizeBytes))
+        return;
     if (m_gifArbiter)
         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
     else if (m_gifPacketCallback)
@@ -2003,6 +2196,8 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
 bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    if (ps2x::asyncvif::active(*this))
+        return false;
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2195,6 +2390,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
 
 bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
 {
+    if (ps2x::asyncvif::active(*this))
+        return false;
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
     static constexpr uint32_t D_STAT = 0x1000E010u;
     static constexpr uint32_t D_CTRL = 0x1000E000u;
@@ -2280,10 +2477,20 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (address == 0x10009000u && ps2x::asyncvif::vu1Busy(*this))
+        return (m_ioRegisters.count(address) ? m_ioRegisters[address] : 0u) | 0x100u;
+    if (isAsyncVifRegister(address))
+        ps2x::asyncvif::sync(*this);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        const uint32_t interrupts = flushEeTimers();
+        if (interrupts != 0u)
+        {
+            eeTimerBacklog(this).undelivered |= interrupts;
+            m_eeTimerEventBudget = 0u;
+        }
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -2302,6 +2509,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        ps2x::asyncvif::sync(*this);
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;

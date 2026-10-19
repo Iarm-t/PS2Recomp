@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include "ps2x/state_io.h"
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -10,6 +11,9 @@
 
 namespace ps2x::iop::detail
 {
+    class IopSio2;
+    class IopSpu2;
+
     class IopMemory
     {
     public:
@@ -22,7 +26,7 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        static constexpr uint32_t HeapBase = 0x00080000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
@@ -68,14 +72,31 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        void attachSio2(IopSio2 *sio2) noexcept { m_sio2 = sio2; }
+        void attachSpu2(IopSpu2 *spu2, const uint64_t *clock) noexcept
+        {
+            m_spu2 = spu2;
+            m_clock = clock;
+        }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+
+        template <typename Ar>
+        void serialize(Ar &ar)
+        {
+            ps2x::state::fields(ar, m_ram, m_owned, m_scratch, m_hardware, m_allocations, m_heapCursor, m_interruptStatus, m_interruptMask,
+                                m_interruptControl, m_dmaStart);
+        }
 
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);
+        [[nodiscard]] bool spu2Owns(uint32_t phys) const noexcept;
+        [[nodiscard]] uint16_t readSpu2(uint32_t phys) const;
+        void writeSpu2(uint32_t phys, uint16_t value);
+        void startSpu2Dma(uint32_t chcrAddress, uint32_t chcr);
 
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;
@@ -87,5 +108,8 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        IopSio2 *m_sio2 = nullptr;
+        IopSpu2 *m_spu2 = nullptr;
+        const uint64_t *m_clock = nullptr;
     };
 }

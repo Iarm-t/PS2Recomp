@@ -4,6 +4,7 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <sstream>
 
 namespace ps2x::iop::detail
 {
@@ -31,6 +32,7 @@ namespace ps2x::iop::detail
         m_nextThreadId = 1;
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
+        m_nextCallThreadId = kFirstCallThreadId;
         m_currentThread = nullptr;
     }
 
@@ -99,6 +101,7 @@ namespace ps2x::iop::detail
             thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
             thread.cpu.gpr[31] = kThreadReturnSentinel;
             thread.state = IopThreadState::Ready;
+            yieldIfHigherPriorityReady(cpu);
             setV0(0);
             return true;
         }
@@ -205,6 +208,8 @@ namespace ps2x::iop::detail
                 it->second.state = IopThreadState::Ready;
             else
                 ++it->second.wakeupCount;
+            if (ordinal == 25)
+                yieldIfHigherPriorityReady(cpu);
             setV0(0);
             return true;
         }
@@ -251,6 +256,8 @@ namespace ps2x::iop::detail
             }
             if (it->second.state == IopThreadState::Suspended)
                 it->second.state = IopThreadState::Ready;
+            if (ordinal == 31)
+                yieldIfHigherPriorityReady(cpu);
             setV0(0);
             return true;
         }
@@ -388,6 +395,8 @@ namespace ps2x::iop::detail
             if (it->second.current < it->second.maximum)
                 ++it->second.current;
             wakeOneSemaphore(id);
+            if (ordinal == 6)
+                yieldIfHigherPriorityReady(cpu);
             setV0(0);
             return true;
         }
@@ -569,6 +578,8 @@ namespace ps2x::iop::detail
                 setV0(-1);
                 return true;
             }
+            if (ordinal == 6)
+                yieldIfHigherPriorityReady(cpu);
             setV0(0);
             return true;
         }
@@ -649,6 +660,118 @@ namespace ps2x::iop::detail
         }
         default:
             return false;
+        }
+    }
+
+    int IopKernel::createModuleStartThread(uint32_t entry, uint32_t gp, uint32_t a0, uint32_t a1, uint32_t priority, uint32_t stackSize)
+    {
+        IopThread thread;
+        thread.id = static_cast<int>(m_nextThreadId++);
+        thread.entry = entry;
+        thread.stackSize = stackSize;
+        thread.priority = std::clamp<uint32_t>(priority, 1u, 126u);
+        thread.initialPriority = thread.priority;
+        thread.stackBase = m_memory.allocate(thread.stackSize + kStackGuardBytes, 16u);
+        if (thread.stackBase == 0u)
+            return 0;
+        thread.cpu.pc = entry;
+        thread.cpu.gpr[4] = a0;
+        thread.cpu.gpr[5] = a1;
+        thread.cpu.gpr[28] = gp;
+        thread.cpu.gpr[29] = alignUp(thread.stackBase + thread.stackSize, 16u) - 16u;
+        thread.cpu.gpr[31] = kThreadReturnSentinel;
+        thread.state = IopThreadState::Ready;
+        const int id = thread.id;
+        m_threads.emplace(id, std::move(thread));
+        return id;
+    }
+
+    bool IopKernel::threadFinished(int id) const
+    {
+        const auto it = m_threads.find(id);
+        return it == m_threads.end() ||
+               it->second.state == IopThreadState::Dormant ||
+               it->second.state == IopThreadState::Dead;
+    }
+
+    uint32_t IopKernel::releaseModuleStartThread(int id)
+    {
+        const auto it = m_threads.find(id);
+        if (it == m_threads.end())
+            return 0u;
+        const uint32_t result = it->second.cpu.gpr[2];
+        if (it->second.state == IopThreadState::Dormant || it->second.state == IopThreadState::Dead)
+        {
+            if (it->second.stackBase != 0u)
+                (void)m_memory.freeAllocation(it->second.stackBase);
+            m_threads.erase(it);
+        }
+        return result;
+    }
+
+    int IopKernel::createCallThread(const IopCpuState &cpu, uint32_t priority)
+    {
+        IopThread thread;
+        thread.id = static_cast<int>(m_nextCallThreadId++);
+        if (m_nextCallThreadId >= 0x7FFFFFFFu)
+            m_nextCallThreadId = kFirstCallThreadId;
+        thread.entry = cpu.pc;
+        thread.priority = std::clamp<uint32_t>(priority, 1u, 126u);
+        thread.initialPriority = thread.priority;
+        thread.cpu = cpu;
+        thread.state = IopThreadState::Ready;
+        const int id = thread.id;
+        m_threads.insert_or_assign(id, std::move(thread));
+        return id;
+    }
+
+    IopThread *IopKernel::beginThread(int id)
+    {
+        IopThread *thread = findThread(id);
+        if (thread == nullptr)
+            return nullptr;
+        m_currentThread = thread;
+        thread->state = IopThreadState::Running;
+        thread->cpu.stopped = false;
+        thread->cpu.yielded = false;
+        return thread;
+    }
+
+    IopThread *IopKernel::findThread(int id)
+    {
+        const auto it = m_threads.find(id);
+        return it != m_threads.end() ? &it->second : nullptr;
+    }
+
+    uint32_t IopKernel::threadPriority(int id, uint32_t fallback) const
+    {
+        const auto it = m_threads.find(id);
+        return it != m_threads.end() ? it->second.priority : fallback;
+    }
+
+    void IopKernel::releaseThread(int id)
+    {
+        const auto it = m_threads.find(id);
+        if (it == m_threads.end())
+            return;
+        if (m_currentThread == &it->second)
+            m_currentThread = nullptr;
+        if (it->second.stackBase != 0u)
+            (void)m_memory.freeAllocation(it->second.stackBase);
+        m_threads.erase(it);
+    }
+
+    void IopKernel::yieldIfHigherPriorityReady(IopCpuState &cpu)
+    {
+        if (m_currentThread == nullptr || &cpu != &m_currentThread->cpu)
+            return;
+        for (const auto &[id, thread] : m_threads)
+        {
+            if (thread.state == IopThreadState::Ready && thread.priority < m_currentThread->priority)
+            {
+                cpu.yielded = true;
+                return;
+            }
         }
     }
 
@@ -740,5 +863,31 @@ namespace ps2x::iop::detail
             if (pc >= base && pc < base + size)
                 thread.state = IopThreadState::Dead;
         }
+    }
+
+    std::vector<std::string> IopKernel::describeThreads() const
+    {
+        std::vector<std::string> lines;
+        for (const auto &[id, thread] : m_threads)
+        {
+            std::ostringstream line;
+            line << "iop thread " << id << " state=" << static_cast<int>(thread.state) << " entry=0x" << std::hex << thread.entry
+                 << " pc=0x" << thread.cpu.pc << " ra=0x" << thread.cpu.gpr[31] << std::dec << " prio=" << thread.priority
+                 << " wait=" << thread.waitId << " bits=0x" << std::hex << thread.waitBits;
+            lines.push_back(line.str());
+        }
+        for (const auto &[id, flag] : m_eventFlags)
+        {
+            std::ostringstream line;
+            line << "iop eventflag " << id << " bits=0x" << std::hex << flag.bits;
+            lines.push_back(line.str());
+        }
+        for (const auto &[id, sema] : m_semaphores)
+        {
+            std::ostringstream line;
+            line << "iop sema " << id << " count=" << sema.current;
+            lines.push_back(line.str());
+        }
+        return lines;
     }
 }

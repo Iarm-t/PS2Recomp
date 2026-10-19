@@ -74,11 +74,20 @@ using EeWaitPayload = std::variant<std::monostate,
                                    EeVSyncWait,
                                    EeExternalWait>;
 
+struct EeResume
+{
+    bool setPc = false;
+    uint32_t pc = 0;
+    bool setResult = false;
+    int32_t result = 0;
+};
+
 struct EeWaitState
 {
     EeWaitReason reason = EeWaitReason::None;
     EeWaitPayload payload{};
     std::function<void(R5900Context &)> completion;
+    EeResume resume{};
 };
 
 enum class GuestInvocationKind : uint8_t
@@ -122,6 +131,7 @@ struct GuestThread
     uint32_t tlsBase = 0;
     EeWaitState wait{};
     std::function<void(R5900Context &)> resumeCompletion;
+    EeResume pendingResume{};
     std::vector<GuestInvocation> invocations;
 
     [[nodiscard]] R5900Context &activeContext()
@@ -267,9 +277,13 @@ public:
     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
     static constexpr uint32_t kGuestDispatchCycles = 8u;
     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
+    static constexpr uint64_t kIdleSkipStepCycles = 1024ull;
+    static constexpr uint32_t kCycleWaitType = 0xC1C1E000u;
 
     explicit EeScheduler(PS2Runtime &runtime);
     ~EeScheduler();
+
+    static void setHostPacingDefault(bool enabled) noexcept;
 
     EeScheduler(const EeScheduler &) = delete;
     EeScheduler &operator=(const EeScheduler &) = delete;
@@ -280,6 +294,7 @@ public:
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
+    uint64_t skipIdleCycles() noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
@@ -299,6 +314,36 @@ public:
     int rotateReadyQueue(int priority, bool interruptSafe);
     int releaseWait(int id, bool interruptSafe);
     void transferIfRequested(bool interruptSafe);
+
+    class DeferredTransferScope
+    {
+    public:
+        explicit DeferredTransferScope(EeScheduler &scheduler) noexcept
+            : m_scheduler(scheduler), m_previous(scheduler.m_deferTransfers)
+        {
+            scheduler.m_deferTransfers = true;
+        }
+        ~DeferredTransferScope()
+        {
+            m_scheduler.m_deferTransfers = m_previous;
+        }
+        DeferredTransferScope(const DeferredTransferScope &) = delete;
+        DeferredTransferScope &operator=(const DeferredTransferScope &) = delete;
+
+    private:
+        EeScheduler &m_scheduler;
+        bool m_previous;
+    };
+
+    [[nodiscard]] bool transferPending() const noexcept
+    {
+        return m_transferPending;
+    }
+
+    [[nodiscard]] bool unwinding() const noexcept
+    {
+        return m_unwinding;
+    }
 
     int createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option);
     int deleteSemaphore(int id, bool interruptSafe);
@@ -332,6 +377,8 @@ public:
     int setIrqHandlerEnabled(bool dmac, int id, bool enabled);
     int setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled);
     void dispatchIrq(bool dmac, uint32_t cause);
+    uint32_t pendingGsInterruptEvents() const noexcept;
+    void dispatchGsInterrupt();
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
     [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
     uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
@@ -340,6 +387,14 @@ public:
     void completeVSync(uint64_t tick);
     void completeExternalWait(uint32_t type, uint64_t token, int result);
     [[noreturn]] void waitExternal(EeWaitReason reason, uint32_t type, uint64_t token, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitUntilCycle(uint64_t cycle, int result, std::function<void(R5900Context &)> completion = {});
+    [[noreturn]] void waitVSyncResume(uint64_t afterTick, int fixedResult, uint32_t resumePc);
+    [[noreturn]] void waitUntilCycleResume(uint64_t cycle, int result, uint32_t resumePc);
+    [[nodiscard]] uint64_t currentCycle() const noexcept
+    {
+        return m_eeCycle;
+    }
+    uint64_t consumeCycles(uint64_t cycles) noexcept;
 
     [[nodiscard]] GuestThread *thread(int id);
     [[nodiscard]] const GuestThread *thread(int id) const;
@@ -358,9 +413,18 @@ public:
     void bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram);
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
+    void setVBlankPeriodMicroseconds(uint32_t microseconds) noexcept;
+    [[nodiscard]] std::chrono::microseconds vblankPeriod() const noexcept;
+    [[nodiscard]] uint64_t vblankPeriodCycles() const noexcept;
     void publishSnapshot();
+    void publishSnapshotNow();
 
 private:
+    template <typename Ar>
+    void serializeMachine(Ar &ar);
+
+    bool serviceStateRequests();
+
     struct ScheduledEvent
     {
         uint64_t deadlineCycle = 0;
@@ -378,7 +442,9 @@ private:
     void makeRunning(GuestThread &thread);
     void makeDormant(GuestThread &thread);
     void removeFromWaitObject(GuestThread &thread);
-    [[noreturn]] void blockCurrent(EeWaitState wait);
+    void enterWait(EeWaitState wait);
+    void blockCurrent(EeWaitState wait);
+    void requestTransfer();
     void makeReady(GuestThread &thread, int result, bool interruptSafe);
     void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
     void applyPendingPreemption();
@@ -397,6 +463,9 @@ private:
     void copyMainContextToRuntime();
     void publishDebugContext(const R5900Context &context);
     void publishIdleDebugContext();
+    void loadSharedVu0Random(R5900Context &context);
+    void saveSharedVu0Random(const R5900Context &context);
+    void hostCatchUp() noexcept;
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;
@@ -412,6 +481,7 @@ private:
     int m_nextSemaphoreId = 1;
     int m_nextEventFlagId = 1;
     int m_nextAlarmId = 1;
+    std::atomic<uint32_t> m_vblankPeriodMicroseconds{16683u};
     int m_nextIntcHandlerId = 1;
     int m_nextDmacHandlerId = 1;
     int m_intcHeadOrder = 0;
@@ -421,10 +491,17 @@ private:
     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
     int m_currentThreadId = 0;
+    mutable GuestThread *m_currentThread = nullptr;
     bool m_rescheduleRequested = false;
+    bool m_unwinding = false;
+    bool m_sharedVu0RandomValid = false;
+    __m128 m_sharedVu0Random{};
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
+    bool m_deferTransfers = false;
+    bool m_transferPending = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
+    uint32_t m_gsInterruptLatched = 0;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
@@ -440,6 +517,7 @@ private:
     std::vector<ScheduledEvent> m_deadlines;
     std::deque<GuestInvocation> m_pendingInvocations;
     uint64_t m_eventSequence = 0;
+    uint64_t m_cycleWaitSequence = 0;
     uint64_t m_invocationSequence = 0;
     uint64_t m_vsyncTick = 0;
     uint32_t m_vsyncFlagAddress = 0;
@@ -449,8 +527,13 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+    bool m_hostPacing = false;
+    uint64_t m_pacingCheckCycle = 0;
+    uint64_t m_pacingRefCycle = 0;
+    std::chrono::steady_clock::time_point m_pacingRefTime{};
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
     uint64_t m_snapshotSequence = 0;
+    bool m_snapshotDirty = true;
 };

@@ -1,6 +1,10 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <algorithm>
 #include <cstring>
+#include <vector>
+#include <cstdlib>
+#include <smmintrin.h>
 
 enum VIFCmd : uint8_t
 {
@@ -78,6 +82,199 @@ namespace
         }
 
         return 0u;
+    }
+
+    template <uint32_t Vl, uint32_t Components, bool ZeroExtend, uint32_t Mode>
+    void unpackScalarFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, uint32_t cl, uint32_t wl, uint32_t *row)
+    {
+        constexpr uint32_t bytesPerComponent = Vl == 0u ? 4u : (Vl == 1u ? 2u : 1u);
+        constexpr uint32_t bytesPerVector = bytesPerComponent * Components;
+        uint32_t destVec = vuAddr;
+        uint32_t cyclePos = 0u;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            uint8_t *dst = vuData + (destVec & 0x3FFu) * 16u;
+            const uint8_t *srcVec = src + index * bytesPerVector;
+            uint32_t v[4];
+            if constexpr (Components < 4u)
+                std::memcpy(v, dst, sizeof(v));
+            for (uint32_t c = 0; c < Components; ++c)
+            {
+                if constexpr (Vl == 0u)
+                    std::memcpy(&v[c], srcVec + c * 4u, 4u);
+                else if constexpr (Vl == 1u)
+                {
+                    uint16_t raw;
+                    std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+                    v[c] = ZeroExtend ? static_cast<uint32_t>(raw) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                }
+                else
+                    v[c] = ZeroExtend ? static_cast<uint32_t>(srcVec[c]) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(srcVec[c])));
+            }
+            if constexpr (Components == 1u)
+                v[1] = v[2] = v[3] = v[0];
+            if constexpr (Mode != 0u)
+            {
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    v[c] += row[c];
+                    if constexpr (Mode == 2u)
+                        row[c] = v[c];
+                }
+            }
+            std::memcpy(dst, v, sizeof(v));
+            ++destVec;
+            if (++cyclePos == wl)
+            {
+                cyclePos = 0u;
+                destVec += cl - wl;
+            }
+        }
+    }
+
+    const bool g_simdUnpackEnabled = []
+    {
+        const char *value = std::getenv("PS2X_VIF_SIMD_UNPACK");
+        return !value || *value != '0';
+    }();
+
+    inline bool simdUnpackEnabled()
+    {
+        return g_simdUnpackEnabled;
+    }
+
+    template <uint32_t Vl, uint32_t Components, bool ZeroExtend, uint32_t Mode>
+    void unpackFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, uint32_t cl, uint32_t wl, uint32_t *row)
+    {
+        if (!simdUnpackEnabled())
+        {
+            unpackScalarFast<Vl, Components, ZeroExtend, Mode>(vuData, vuAddr, src, count, cl, wl, row);
+            return;
+        }
+        constexpr uint32_t bytes = (Vl == 0u ? 4u : Vl == 1u ? 2u : 1u) * Components;
+        const __m128i mask = _mm_setr_epi32(-1, Components > 1u ? -1 : 0, Components > 2u ? -1 : 0, Components > 3u ? -1 : 0);
+        __m128i rowValue = _mm_loadu_si128(reinterpret_cast<const __m128i *>(row));
+        uint32_t destVec = vuAddr;
+        uint32_t cyclePos = 0u;
+        for (uint32_t index = 0; index < count; ++index)
+        {
+            const uint8_t *source = src + index * bytes;
+            __m128i value;
+            if constexpr (Vl == 0u)
+            {
+                if constexpr (Components == 4u)
+                    value = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source));
+                else if constexpr (Components == 1u)
+                {
+                    int32_t v = 0;
+                    std::memcpy(&v, source, sizeof(v));
+                    value = _mm_cvtsi32_si128(v);
+                }
+                else if constexpr (Components == 2u)
+                    value = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(source));
+                else
+                    value = _mm_castps_si128(_mm_movelh_ps(_mm_castsi128_ps(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(source))), _mm_load_ss(reinterpret_cast<const float *>(source + 8u))));
+            }
+            else
+            {
+                __m128i raw;
+                if constexpr (bytes == 1u)
+                    raw = _mm_cvtsi32_si128(static_cast<int32_t>(source[0]));
+                else if constexpr (bytes == 2u)
+                {
+                    uint16_t v = 0u;
+                    std::memcpy(&v, source, sizeof(v));
+                    raw = _mm_cvtsi32_si128(static_cast<int32_t>(v));
+                }
+                else if constexpr (bytes == 3u)
+                    raw = _mm_cvtsi32_si128(static_cast<int32_t>(static_cast<uint32_t>(source[0]) | (static_cast<uint32_t>(source[1]) << 8u) | (static_cast<uint32_t>(source[2]) << 16u)));
+                else if constexpr (bytes == 4u)
+                {
+                    int32_t v = 0;
+                    std::memcpy(&v, source, sizeof(v));
+                    raw = _mm_cvtsi32_si128(v);
+                }
+                else if constexpr (bytes == 6u)
+                {
+                    uint32_t lo = 0u;
+                    uint16_t hi = 0u;
+                    std::memcpy(&lo, source, sizeof(lo));
+                    std::memcpy(&hi, source + 4u, sizeof(hi));
+                    raw = _mm_cvtsi64_si128(static_cast<int64_t>(static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u)));
+                }
+                else
+                    raw = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(source));
+                if constexpr (Vl == 1u)
+                    value = ZeroExtend ? _mm_cvtepu16_epi32(raw) : _mm_cvtepi16_epi32(raw);
+                else
+                    value = ZeroExtend ? _mm_cvtepu8_epi32(raw) : _mm_cvtepi8_epi32(raw);
+            }
+            auto *destination = reinterpret_cast<__m128i *>(vuData + (destVec & 0x3FFu) * 16u);
+            if constexpr (Components == 1u)
+                value = _mm_shuffle_epi32(value, 0u);
+            else if constexpr (Components < 4u)
+                value = _mm_or_si128(_mm_and_si128(mask, value), _mm_andnot_si128(mask, _mm_loadu_si128(destination)));
+            if constexpr (Mode != 0u)
+            {
+                value = _mm_add_epi32(value, rowValue);
+                if constexpr (Mode == 2u)
+                    rowValue = value;
+            }
+            _mm_storeu_si128(destination, value);
+            ++destVec;
+            if (++cyclePos == wl)
+            {
+                cyclePos = 0u;
+                destVec += cl - wl;
+            }
+        }
+        if constexpr (Mode == 2u)
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(row), rowValue);
+    }
+
+    template <uint32_t Vl, uint32_t Components>
+    void unpackFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, bool zeroExtend, uint32_t mode, uint32_t cl,
+                    uint32_t wl, uint32_t *row)
+    {
+        if (zeroExtend)
+        {
+            if (mode == 1u)
+                unpackFast<Vl, Components, true, 1u>(vuData, vuAddr, src, count, cl, wl, row);
+            else if (mode == 2u)
+                unpackFast<Vl, Components, true, 2u>(vuData, vuAddr, src, count, cl, wl, row);
+            else
+                unpackFast<Vl, Components, true, 0u>(vuData, vuAddr, src, count, cl, wl, row);
+        }
+        else
+        {
+            if (mode == 1u)
+                unpackFast<Vl, Components, false, 1u>(vuData, vuAddr, src, count, cl, wl, row);
+            else if (mode == 2u)
+                unpackFast<Vl, Components, false, 2u>(vuData, vuAddr, src, count, cl, wl, row);
+            else
+                unpackFast<Vl, Components, false, 0u>(vuData, vuAddr, src, count, cl, wl, row);
+        }
+    }
+
+    bool tryUnpackFast(uint8_t *vuData, uint32_t vuAddr, const uint8_t *src, uint32_t count, uint32_t vl, uint32_t components, bool zeroExtend,
+                       uint32_t mode, uint32_t cl, uint32_t wl, uint32_t *row)
+    {
+        switch (vl * 4u + components - 1u)
+        {
+        case 0u: unpackFast<0u, 1u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 1u: unpackFast<0u, 2u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 2u: unpackFast<0u, 3u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 3u: unpackFast<0u, 4u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 4u: unpackFast<1u, 1u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 5u: unpackFast<1u, 2u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 6u: unpackFast<1u, 3u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 7u: unpackFast<1u, 4u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 8u: unpackFast<2u, 1u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 9u: unpackFast<2u, 2u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 10u: unpackFast<2u, 3u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        case 11u: unpackFast<2u, 4u>(vuData, vuAddr, src, count, zeroExtend, mode, cl, wl, row); return true;
+        default: return false;
+        }
     }
 }
 
@@ -304,33 +501,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
-        if (m_vif1PendingPath2ImageQwc != 0u)
-        {
-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
-            if (availableQw == 0u)
-            {
-                break;
-            }
-
-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
-            const uint64_t imageTag =
-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
-                (static_cast<uint64_t>(kGifFmtImage) << 58);
-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
-
-            pos += chunkQw * 16u;
-            m_vif1PendingPath2ImageQwc -= chunkQw;
-            if (m_vif1PendingPath2ImageQwc == 0u)
-            {
-                m_vif1PendingPath2DirectHl = false;
-            }
-            continue;
-        }
-
         uint32_t cmd;
         memcpy(&cmd, data + pos, 4);
         pos += 4;
@@ -498,13 +668,35 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
-
-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
-                if (pendingImageQw != 0u)
+                uint32_t imageQw = 0u;
+                if (m_vif1PendingPath2ImageQwc != 0u)
                 {
-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
-                    m_vif1PendingPath2DirectHl = directHl;
+                    imageQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, qwCount);
+                    std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(imageQw) * 16u, 0u);
+                    const uint64_t imageTag =
+                        static_cast<uint64_t>(imageQw & 0x7FFFu) |
+                        ((m_vif1PendingPath2ImageQwc == imageQw) ? (1ull << 15) : 0ull) |
+                        (static_cast<uint64_t>(kGifFmtImage) << 58);
+                    std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+                    std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(imageQw) * 16u);
+                    submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+                    m_vif1PendingPath2ImageQwc -= imageQw;
+                    if (m_vif1PendingPath2ImageQwc == 0u)
+                        m_vif1PendingPath2DirectHl = false;
+                }
+
+                if (imageQw < qwCount)
+                {
+                    const uint8_t *packets = data + pos + imageQw * 16u;
+                    const uint32_t packetBytes = (qwCount - imageQw) * 16u;
+                    submitGifPacket(GifPathId::Path2, packets, packetBytes, true, directHl);
+
+                    const uint32_t pendingImageQw = pendingGifImageQwc(packets, packetBytes);
+                    if (pendingImageQw != 0u)
+                    {
+                        m_vif1PendingPath2ImageQwc = pendingImageQw;
+                        m_vif1PendingPath2DirectHl = directHl;
+                    }
                 }
             }
 
@@ -572,7 +764,89 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && !maskEnable && cl >= wl && (vl != 3u || vn == 3u))
+            {
+                const uint8_t *srcBase = data + pos;
+                const uint32_t mode = vif1_regs.mode & 3u;
+                const bool add = (vl != 3u || vn != 3u) && (mode == 1u || mode == 2u);
+                const uint32_t limit = components > 4 ? 4u : static_cast<uint32_t>(components);
+                uint32_t firstWrite = 0u;
+                if (vl == 0u && components == 4 && !add && cl == wl)
+                {
+                    const uint32_t first = std::min(writeVectorCount, 0x400u - vuAddr);
+                    std::memcpy(m_vu1Data + vuAddr * 16u, srcBase, first * 16u);
+                    if (first < writeVectorCount)
+                        std::memcpy(m_vu1Data, srcBase + first * 16u, (writeVectorCount - first) * 16u);
+                    firstWrite = writeVectorCount;
+                }
+                else if (vl != 3u && tryUnpackFast(m_vu1Data, vuAddr, srcBase, writeVectorCount, vl, static_cast<uint32_t>(components), zeroExtend,
+                                                   add ? mode : 0u, cl, wl, vif1_regs.row))
+                {
+                    firstWrite = writeVectorCount;
+                }
+                for (uint32_t writeIndex = firstWrite; writeIndex < writeVectorCount; ++writeIndex)
+                {
+                    const uint32_t destVec = (vuAddr + (writeIndex / wl) * cl + writeIndex % wl) & 0x3FFu;
+                    uint8_t *dst = m_vu1Data + destVec * 16u;
+                    const uint8_t *srcVec = srcBase + writeIndex * bytesPerVector;
+                    uint32_t v[4];
+                    if (vl == 0u && components == 4)
+                        std::memcpy(v, srcVec, sizeof(v));
+                    else
+                    {
+                        std::memcpy(v, dst, sizeof(v));
+                        if (vl == 0u)
+                        {
+                            if (components == 1)
+                            {
+                                uint32_t scalar;
+                                std::memcpy(&scalar, srcVec, sizeof(scalar));
+                                v[0] = v[1] = v[2] = v[3] = scalar;
+                            }
+                            else
+                                std::memcpy(v, srcVec, limit * 4u);
+                        }
+                        else if (vl == 1u)
+                        {
+                            for (uint32_t c = 0; c < (components == 1 ? 1u : limit); ++c)
+                            {
+                                uint16_t raw;
+                                std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
+                                v[c] = zeroExtend ? static_cast<uint32_t>(raw) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                            }
+                            if (components == 1)
+                                v[1] = v[2] = v[3] = v[0];
+                        }
+                        else if (vl == 2u)
+                        {
+                            for (uint32_t c = 0; c < (components == 1 ? 1u : limit); ++c)
+                                v[c] = zeroExtend ? static_cast<uint32_t>(srcVec[c]) : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(srcVec[c])));
+                            if (components == 1)
+                                v[1] = v[2] = v[3] = v[0];
+                        }
+                        else
+                        {
+                            uint16_t packed;
+                            std::memcpy(&packed, srcVec, sizeof(packed));
+                            v[0] = packed & 0x1Fu;
+                            v[1] = (packed >> 5) & 0x1Fu;
+                            v[2] = (packed >> 10) & 0x1Fu;
+                            v[3] = (packed >> 15) & 0x01u;
+                        }
+                    }
+                    if (add)
+                    {
+                        for (uint32_t c = 0; c < 4u; ++c)
+                        {
+                            v[c] += vif1_regs.row[c];
+                            if (mode == 2u)
+                                vif1_regs.row[c] = v[c];
+                        }
+                    }
+                    std::memcpy(dst, v, sizeof(v));
+                }
+            }
+            else if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
