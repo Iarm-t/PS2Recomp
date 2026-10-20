@@ -2618,7 +2618,7 @@ struct VU1InterpreterAccess
             _mm_storeu_ps(target, blendDest(_mm_loadu_ps(target), value, dest));
     }
 
-    static VU1_FORCE_INLINE __m128 vnorm(__m128 value)
+    static VU1_FORCE_INLINE __m128 vnormReference(__m128 value)
     {
         const __m128i bits = _mm_castps_si128(value);
         const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
@@ -2629,6 +2629,18 @@ struct VU1InterpreterAccess
         result = _mm_or_si128(_mm_andnot_si128(huge, result),
                               _mm_and_si128(huge, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF))));
         return _mm_castsi128_ps(result);
+    }
+
+    template <bool Lean = true>
+    static VU1_FORCE_INLINE __m128 vnorm(__m128 value)
+    {
+        if constexpr (!Lean)
+            return vnormReference(value);
+        const __m128i bits = _mm_castps_si128(value);
+        const __m128i magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
+        const __m128i clamped = _mm_and_si128(_mm_min_epu32(magnitude, _mm_set1_epi32(0x7F7FFFFF)),
+                                              _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x007FFFFF)));
+        return _mm_castsi128_ps(_mm_or_si128(_mm_xor_si128(bits, magnitude), clamped));
     }
 
     static VU1_FORCE_INLINE __m128 vfN(VU1Interpreter &vu, uint32_t reg)
@@ -2693,17 +2705,19 @@ struct VU1InterpreterAccess
     static void syncAllNorm(VU1Interpreter &vu, Vu1FastCtx &ctx)
     {
         for (uint32_t reg = 0; reg < 33u; ++reg)
-            _mm_store_ps(ctx.norm[reg], vnorm(_mm_loadu_ps(rawReg(vu, reg))));
+            _mm_store_ps(ctx.norm[reg], vnormReference(_mm_loadu_ps(rawReg(vu, reg))));
     }
 
+    template <bool Lean = true>
     static VU1_FORCE_INLINE __m128 qN(VU1Interpreter &vu)
     {
-        return vnorm(_mm_set1_ps(vu.m_state.q));
+        return vnorm<Lean>(_mm_set1_ps(vu.m_state.q));
     }
 
+    template <bool Lean = true>
     static VU1_FORCE_INLINE __m128 iN(VU1Interpreter &vu)
     {
-        return vnorm(_mm_set1_ps(vu.m_state.i));
+        return vnorm<Lean>(_mm_set1_ps(vu.m_state.i));
     }
 
     static VU1_FORCE_INLINE uint32_t maskBits(__m128d lo, __m128d hi)
@@ -3053,7 +3067,7 @@ struct VU1InterpreterAccess
         ready[3] = value;
     }
 
-    template <FK K>
+    template <FK K, bool Lean = true>
     static VU1_NOINLINE __m128 fmacExact(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
                                          __m128 result, __m128 &normalized, FmacFlags &flags)
     {
@@ -3150,16 +3164,16 @@ struct VU1InterpreterAccess
             flags.status = status;
             flags.extra = extra;
         }
-        normalized = vnorm(result);
+        normalized = vnorm<Lean>(result);
         return result;
     }
 
-    template <FK K>
+    template <FK K, bool Lean = true>
     static VU1_FORCE_INLINE __m128 fmac(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
                                         __m128 &normalized)
     {
         FmacFlags flags;
-        const __m128 result = fmacF<K>(vu, ctx, cycle, dest, s, t, a, normalized, flags);
+        const __m128 result = fmacF<K, Lean>(vu, ctx, cycle, dest, s, t, a, normalized, flags);
         if (dest != 0u)
             pushFmacFlags(vu, ctx, cycle, flags.mac, flags.status, flags.extra);
         return result;
@@ -3173,22 +3187,20 @@ struct VU1InterpreterAccess
         __m128 product;
         __m128 resultZero;
         __m128 productZero;
+        __m128 stickyZero;
         bool safe;
     };
 
     template <FK K>
-    static VU1_FORCE_INLINE FmacCore fmacCore(uint32_t dest, __m128 s, __m128 t, __m128 a)
+    static VU1_FORCE_INLINE void fmacValues(__m128 &s, __m128 &t, __m128 a, __m128 &result, __m128 &product)
     {
         constexpr bool cross = K == FK::Opmsub || K == FK::Opmula;
-        constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
         if constexpr (cross)
         {
             s = _mm_shuffle_ps(s, s, _MM_SHUFFLE(3, 0, 2, 1));
             t = _mm_shuffle_ps(t, t, _MM_SHUFFLE(3, 1, 0, 2));
         }
-
-        __m128 result;
-        __m128 product = _mm_setzero_ps();
+        product = _mm_setzero_ps();
         if constexpr (K == FK::Add)
             result = _mm_add_ps(s, t);
         else if constexpr (K == FK::Sub)
@@ -3205,7 +3217,15 @@ struct VU1InterpreterAccess
         }
         if constexpr (cross)
             result = _mm_and_ps(result, destMask(0xEu));
+    }
 
+    template <FK K>
+    static VU1_FORCE_INLINE FmacCore fmacCoreReference(uint32_t dest, __m128 s, __m128 t, __m128 a)
+    {
+        constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
+        __m128 result;
+        __m128 product;
+        fmacValues<K>(s, t, a, result, product);
         const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
         const __m128 zero = _mm_setzero_ps();
         const __m128 absResult = _mm_and_ps(result, absMask);
@@ -3233,18 +3253,67 @@ struct VU1InterpreterAccess
                 safe = _mm_or_ps(safe, _mm_and_ps(resultZero, productZero));
         }
         const uint32_t destLanes = kRev4[dest];
-        return {s, t, result, product, resultZero, productZero,
+        return {s, t, result, product, resultZero, productZero, productSum ? _mm_or_ps(resultZero, productZero) : resultZero,
                 (static_cast<uint32_t>(_mm_movemask_ps(safe)) & destLanes) == destLanes};
     }
 
-    template <FK K>
+    template <FK K, bool Lean = true>
+    static VU1_FORCE_INLINE FmacCore fmacCore(uint32_t dest, __m128 s, __m128 t, __m128 a)
+    {
+        constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
+        if constexpr (!Lean)
+            return fmacCoreReference<K>(dest, s, t, a);
+        __m128 result;
+        __m128 product;
+        fmacValues<K>(s, t, a, result, product);
+        const __m128 zero = _mm_setzero_ps();
+        const __m128i magnitudeMask = _mm_set1_epi32(0x7FFFFFFF);
+        const __m128i resultBits = _mm_and_si128(_mm_castps_si128(result), magnitudeMask);
+        const auto normalWindow = [](__m128i magnitude)
+        {
+            return _mm_castsi128_ps(_mm_cmpgt_epi32(_mm_set1_epi32(static_cast<int32_t>(0xFEFFFFFFu)),
+                                                    _mm_add_epi32(magnitude, _mm_set1_epi32(0x7F800000))));
+        };
+        __m128 safe;
+        __m128 resultZero;
+        __m128 productZero = zero;
+        if constexpr (K == FK::Add || K == FK::Sub)
+        {
+            resultZero = _mm_cmpeq_ps(result, zero);
+            const __m128 cancels = K == FK::Add ? _mm_cmpeq_ps(s, _mm_xor_ps(t, _mm_set1_ps(-0.0f))) : _mm_cmpeq_ps(s, t);
+            safe = _mm_or_ps(normalWindow(resultBits), _mm_and_ps(resultZero, cancels));
+        }
+        else
+        {
+            productZero = _mm_or_ps(_mm_cmpeq_ps(s, zero), _mm_cmpeq_ps(t, zero));
+            if constexpr (productSum)
+            {
+                resultZero = _mm_cmpeq_ps(result, zero);
+                const __m128i productBits = _mm_and_si128(_mm_castps_si128(product), magnitudeMask);
+                const __m128i cancelFloor = _mm_max_epi32(_mm_sub_epi32(productBits, _mm_set1_epi32(0x0A800000)), _mm_set1_epi32(0x017FFFFF));
+                const __m128i resultOk = _mm_and_si128(_mm_cmpgt_epi32(resultBits, cancelFloor),
+                                                       _mm_cmpgt_epi32(_mm_set1_epi32(0x7F000000), resultBits));
+                safe = _mm_or_ps(_mm_and_ps(_mm_castsi128_ps(resultOk), normalWindow(productBits)), productZero);
+            }
+            else
+            {
+                resultZero = productZero;
+                safe = _mm_or_ps(normalWindow(resultBits), productZero);
+            }
+        }
+        const uint32_t destLanes = kRev4[dest];
+        return {s, t, result, product, resultZero, productZero, productSum ? productZero : resultZero,
+                (static_cast<uint32_t>(_mm_movemask_ps(safe)) & destLanes) == destLanes};
+    }
+
+    template <FK K, bool Lean = true>
     static VU1_FORCE_INLINE __m128 fmacF(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
                                          __m128 &normalized, FmacFlags &flags)
     {
         constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
-        const FmacCore c = fmacCore<K>(dest, s, t, a);
+        const FmacCore c = fmacCore<K, Lean>(dest, s, t, a);
         if (!c.safe)
-            return fmacExact<K>(vu, ctx, cycle, dest, c.s, c.t, a, c.result, normalized, flags);
+            return fmacExact<K, Lean>(vu, ctx, cycle, dest, c.s, c.t, a, c.result, normalized, flags);
         if (dest != 0u)
         {
             const uint32_t destLanes = kRev4[dest];
@@ -3265,26 +3334,23 @@ struct VU1InterpreterAccess
         return c.result;
     }
 
-    template <FK K>
+    template <FK K, bool Lean = true>
     static VU1_FORCE_INLINE __m128 fmacV(VU1Interpreter &vu, Vu1FastCtx &ctx, uint64_t cycle, uint32_t dest, __m128 s, __m128 t, __m128 a,
                                          __m128 &normalized, __m128 &accZero, __m128 &accSign, uint32_t &accScalar)
     {
         constexpr bool productSum = K == FK::Madd || K == FK::Msub || K == FK::Opmsub;
-        const FmacCore c = fmacCore<K>(dest, s, t, a);
+        const FmacCore c = fmacCore<K, Lean>(dest, s, t, a);
         if (!c.safe)
         {
             FmacFlags flags;
-            const __m128 result = fmacExact<K>(vu, ctx, cycle, dest, c.s, c.t, a, c.result, normalized, flags);
+            const __m128 result = fmacExact<K, Lean>(vu, ctx, cycle, dest, c.s, c.t, a, c.result, normalized, flags);
             accScalar |= flags.status | flags.extra;
             return result;
         }
-        __m128 zeroLanes = c.resultZero;
+        __m128 zeroLanes = c.stickyZero;
         __m128 signLanes = c.result;
         if constexpr (productSum)
-        {
-            zeroLanes = _mm_or_ps(zeroLanes, c.productZero);
             signLanes = _mm_or_ps(signLanes, c.product);
-        }
         if (dest != 0xFu)
         {
             const __m128 mask = destMask(dest);

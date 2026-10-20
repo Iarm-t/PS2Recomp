@@ -36,6 +36,150 @@ namespace
         }
     };
 
+    struct LeanFmacOutcome
+    {
+        uint32_t result[4];
+        uint32_t normalized[4];
+        uint32_t mac;
+        uint32_t status;
+        uint32_t extra;
+        uint32_t sticky;
+    };
+
+    template <VU1InterpreterAccess::FK K, bool Lean>
+    LeanFmacOutcome runLeanFmac(bool collapsed, uint32_t dest, __m128 s, __m128 t, __m128 a)
+    {
+        using A = VU1InterpreterAccess;
+        VU1Interpreter vu(VU1Interpreter::Unit::VU1);
+        Vu1FastCtx ctx;
+        LeanFmacOutcome outcome{};
+        __m128 normalized = _mm_setzero_ps();
+        __m128 result;
+        if (collapsed)
+        {
+            __m128 accZero = _mm_setzero_ps();
+            __m128 accSign = _mm_setzero_ps();
+            uint32_t accScalar = 0u;
+            result = A::fmacV<K, Lean>(vu, ctx, 0u, dest, s, t, a, normalized, accZero, accSign, accScalar);
+            outcome.sticky = accScalar | A::stickyOf(accZero, accSign);
+        }
+        else
+        {
+            A::FmacFlags flags;
+            result = A::fmacF<K, Lean>(vu, ctx, 0u, dest, s, t, a, normalized, flags);
+            outcome.mac = flags.mac;
+            outcome.status = flags.status;
+            outcome.extra = flags.extra;
+        }
+        alignas(16) uint32_t resultBits[4];
+        alignas(16) uint32_t normalizedBits[4];
+        _mm_store_ps(reinterpret_cast<float *>(resultBits), result);
+        _mm_store_ps(reinterpret_cast<float *>(normalizedBits), normalized);
+        for (uint32_t lane = 0; lane < 4u; ++lane)
+        {
+            const bool written = (dest & (8u >> lane)) != 0u;
+            outcome.result[lane] = written ? resultBits[lane] : 0u;
+            outcome.normalized[lane] = written ? normalizedBits[lane] : 0u;
+        }
+        return outcome;
+    }
+
+    template <VU1InterpreterAccess::FK K>
+    bool leanFmacMatches(uint32_t dest, __m128 s, __m128 t, __m128 a)
+    {
+        for (const bool collapsed : {false, true})
+        {
+            const LeanFmacOutcome reference = runLeanFmac<K, false>(collapsed, dest, s, t, a);
+            const LeanFmacOutcome lean = runLeanFmac<K, true>(collapsed, dest, s, t, a);
+            if (std::memcmp(&reference, &lean, sizeof(reference)) != 0)
+                return false;
+        }
+        return true;
+    }
+
+    uint32_t leanNext(uint32_t &state)
+    {
+        state = state * 1664525u + 1013904223u;
+        return state;
+    }
+
+    uint32_t leanSampleBits(uint32_t &state)
+    {
+        const uint32_t random = leanNext(state);
+        const uint32_t mantissa = leanNext(state) & 0x007FFFFFu;
+        const uint32_t sign = random & 0x80000000u;
+        static constexpr uint32_t kExponents[] = {0u, 1u, 2u, 3u, 4u, 5u, 21u, 22u, 23u, 60u, 100u, 126u, 127u, 128u,
+                                                  150u, 200u, 252u, 253u, 254u, 255u};
+        uint32_t exponent;
+        switch ((random >> 8) & 3u)
+        {
+        case 0u:
+            exponent = kExponents[(random >> 12) % (sizeof(kExponents) / sizeof(kExponents[0]))];
+            break;
+        case 1u:
+            exponent = 100u + ((random >> 12) % 56u);
+            break;
+        default:
+            exponent = (random >> 12) & 0xFFu;
+            break;
+        }
+        uint32_t fraction = mantissa;
+        switch ((random >> 4) & 7u)
+        {
+        case 0u:
+            fraction = 0u;
+            break;
+        case 1u:
+            fraction = 0x007FFFFFu;
+            break;
+        case 2u:
+            fraction = mantissa & 0x7Fu;
+            break;
+        default:
+            break;
+        }
+        return sign | (exponent << 23) | fraction;
+    }
+
+    __m128 leanSampleVector(uint32_t &state, bool broadcast)
+    {
+        alignas(16) uint32_t bits[4];
+        for (uint32_t lane = 0; lane < 4u; ++lane)
+            bits[lane] = broadcast && lane != 0u ? bits[0] : leanSampleBits(state);
+        return VU1InterpreterAccess::vnorm<false>(_mm_load_ps(reinterpret_cast<const float *>(bits)));
+    }
+
+    template <VU1InterpreterAccess::FK K>
+    uint32_t leanFmacSweep(uint32_t seed, uint32_t iterations)
+    {
+        constexpr bool subtracts = K == VU1InterpreterAccess::FK::Msub || K == VU1InterpreterAccess::FK::Opmsub;
+        uint32_t state = seed;
+        uint32_t mismatches = 0u;
+        const uint32_t previous = _mm_getcsr();
+        _mm_setcsr(previous | 0x6000u);
+        for (uint32_t iteration = 0; iteration < iterations; ++iteration)
+        {
+            const __m128 s = leanSampleVector(state, false);
+            const __m128 t = leanSampleVector(state, (iteration & 1u) != 0u);
+            __m128 a = leanSampleVector(state, false);
+            const uint32_t choice = leanNext(state);
+            if ((choice >> 28) < 6u)
+            {
+                const __m128 product = _mm_mul_ps(s, t);
+                const __m128 base = subtracts ? product : _mm_xor_ps(product, _mm_set1_ps(-0.0f));
+                const __m128i nudge = _mm_set1_epi32(static_cast<int32_t>((choice >> 8) & 3u) - 1);
+                a = VU1InterpreterAccess::vnorm<false>(_mm_castsi128_ps(_mm_add_epi32(_mm_castps_si128(base), nudge)));
+            }
+            const uint32_t dest = (choice >> 4) & 0xFu;
+            if (!leanFmacMatches<K>(dest, s, t, a))
+                ++mismatches;
+            if (!leanFmacMatches<K>(0xFu, s, t, a))
+                ++mismatches;
+        }
+        _mm_setcsr(previous);
+        return mismatches;
+    }
+
     uint32_t makeVifCmd(uint8_t opcode, uint8_t num, uint16_t imm)
     {
         return (static_cast<uint32_t>(opcode) << 24) |
@@ -1713,6 +1857,32 @@ void register_ps2_vu1_tests()
             VU1InterpreterAccess::runLoopWith(vu1, fx.code, PS2_VU1_CODE_SIZE, fx.data,
                                              PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 1u, nullptr);
             t.IsTrue(!vu1NormShadow.valid, "interpreted VU1 execution should invalidate its cache");
+        });
+
+        tc.Run("lean FMAC checks and normalization match the reference paths", [](TestCase &t)
+        {
+            using A = VU1InterpreterAccess;
+            uint32_t state = 0x2468ACE1u;
+            uint32_t normMismatches = 0u;
+            for (uint32_t iteration = 0; iteration < 200000u; ++iteration)
+            {
+                alignas(16) uint32_t bits[4];
+                for (uint32_t lane = 0; lane < 4u; ++lane)
+                    bits[lane] = leanSampleBits(state);
+                const __m128 value = _mm_load_ps(reinterpret_cast<const float *>(bits));
+                const __m128 reference = A::vnorm<false>(value);
+                const __m128 lean = A::vnorm<true>(value);
+                if (_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_castps_si128(reference), _mm_castps_si128(lean)))) != 0xF)
+                    ++normMismatches;
+            }
+            t.Equals(normMismatches, 0u, "lean normalization should match the reference bit for bit");
+            t.Equals(leanFmacSweep<A::FK::Add>(1u, 60000u), 0u, "lean ADD checks should match the exact path");
+            t.Equals(leanFmacSweep<A::FK::Sub>(2u, 60000u), 0u, "lean SUB checks should match the exact path");
+            t.Equals(leanFmacSweep<A::FK::Mul>(3u, 60000u), 0u, "lean MUL checks should match the exact path");
+            t.Equals(leanFmacSweep<A::FK::Madd>(4u, 60000u), 0u, "lean MADD checks should match the exact path");
+            t.Equals(leanFmacSweep<A::FK::Msub>(5u, 60000u), 0u, "lean MSUB checks should match the exact path");
+            t.Equals(leanFmacSweep<A::FK::Opmsub>(6u, 60000u), 0u, "lean OPMSUB checks should match the exact path");
+            t.Equals(leanFmacSweep<A::FK::Opmula>(7u, 60000u), 0u, "lean OPMULA checks should match the exact path");
         });
 
         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)

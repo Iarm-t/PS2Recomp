@@ -8,6 +8,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -724,6 +725,24 @@ namespace
         int backupReg = -1;
         std::string backupVar;
     };
+
+    bool settingEnabled(const char *name)
+    {
+        const char *value = std::getenv(name);
+        return !value || *value != '0';
+    }
+
+    const bool kLeanFmac = settingEnabled("PS2X_VU1_LEAN_FMAC");
+    const bool kLeanNorm = settingEnabled("PS2X_VU1_LEAN_NORM");
+
+    std::string referencePaths(std::string text)
+    {
+        if (!kLeanFmac)
+            text = std::regex_replace(text, std::regex(R"(\b(fmac[VF]?<FK::\w+)>)"), "$1, false>");
+        if (!kLeanNorm)
+            text = std::regex_replace(text, std::regex(R"(\b(vnorm|qN|iN)\()"), "$1<false>(");
+        return text;
+    }
 
     std::string segLabel(uint32_t pc)
     {
@@ -1499,7 +1518,7 @@ namespace
                 if (emitter.exits.count(name))
                     out << name << ":\n    ctx.cycle = cyc;\n    vu.m_state.pc = epc;\n    return StepResult::" << result << ";\n";
             out << "}\n\n";
-            blockTexts.push_back(out.str());
+            blockTexts.push_back(referencePaths(out.str()));
         }
 
         uint32_t part = 0u;
@@ -1551,6 +1570,7 @@ int main(int argc, char **argv)
     const std::filesystem::path captureDir = argv[1];
     const std::filesystem::path outDir = argv[2];
     const uint32_t blockPairs = argc > 3 ? static_cast<uint32_t>(std::stoul(argv[3])) : kDefaultBlockPairs;
+    std::cout << "lean FMAC checks " << (kLeanFmac ? "on" : "off") << ", lean normalization " << (kLeanNorm ? "on" : "off") << "\n";
     std::filesystem::create_directories(outDir);
     for (const auto &entry : std::filesystem::directory_iterator(outDir))
     {
