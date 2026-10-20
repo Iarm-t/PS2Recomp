@@ -58,7 +58,10 @@ namespace ps2recomp
                                    "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]); }}",
                                    ft, fd, fs, ft);
             case COP1_S_SQRT:
-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
+                // The EE FPU reads the SQRT.S operand from the ft field (MIPS IV says fs; the
+                // hardware and games built for it use ft - SOTC has 69 sqrt.s sites with
+                // fs=0 and the source in ft, e.g. 0x1ace70 sqrt.s f0, f2, f0).
+                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:

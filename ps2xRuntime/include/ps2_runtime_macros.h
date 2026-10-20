@@ -371,9 +371,9 @@ inline __m128 ps2_vmul(__m128 a, __m128 b)
 }
 
 // PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) ps2_vadd((__m128)(a), (__m128)(b))
-#define PS2_VSUB(a, b) ps2_vsub((__m128)(a), (__m128)(b))
-#define PS2_VMUL(a, b) ps2_vmul((__m128)(a), (__m128)(b))
+#define PS2_VADD(a, b) ps2VuClampVector(_mm_add_ps((__m128)(a), (__m128)(b)))
+#define PS2_VSUB(a, b) ps2VuClampVector(_mm_sub_ps((__m128)(a), (__m128)(b)))
+#define PS2_VMUL(a, b) ps2VuClampVector(_mm_mul_ps((__m128)(a), (__m128)(b)))
 
 // FPU and VU helpers from the port work: flag-aware FCR31/VU-status arithmetic used by the VU0 macro
 // translations and the ps2xTest checks. The macros above supersede the port's FPU_* macro rewrites.
@@ -432,6 +432,39 @@ constexpr uint32_t PS2_FCR31_I = 0x00020000u;
 constexpr uint32_t PS2_FCR31_D = 0x00010000u;
 constexpr uint32_t PS2_FCR31_SI = 0x00000040u;
 constexpr uint32_t PS2_FCR31_SD = 0x00000020u;
+
+// Bisect revert: the port's pre-merge EE FPU operand alignment (the smaller operand's low mantissa
+// bits are dropped when the exponents differ, as on the hardware).
+PS2_FORCEINLINE void ps2FpuAlignOperands(float &a, float &b)
+{
+    uint32_t ua;
+    uint32_t ub;
+    std::memcpy(&ua, &a, sizeof(ua));
+    std::memcpy(&ub, &b, sizeof(ub));
+    const int32_t diff = static_cast<int32_t>((ua >> 23) & 0xFFu) - static_cast<int32_t>((ub >> 23) & 0xFFu);
+    if (diff >= 25)
+        ub &= 0x80000000u;
+    else if (diff > 0)
+        ub &= 0xFFFFFFFFu << (diff - 1);
+    else if (diff <= -25)
+        ua &= 0x80000000u;
+    else if (diff < 0)
+        ua &= 0xFFFFFFFFu << (-diff - 1);
+    std::memcpy(&a, &ua, sizeof(a));
+    std::memcpy(&b, &ub, sizeof(b));
+}
+
+PS2_FORCEINLINE float ps2FpuAdd(float a, float b)
+{
+    ps2FpuAlignOperands(a, b);
+    return ps2FpuClamp(a + b);
+}
+
+PS2_FORCEINLINE float ps2FpuSub(float a, float b)
+{
+    ps2FpuAlignOperands(a, b);
+    return ps2FpuClamp(a - b);
+}
 
 inline float ps2FpuDivideNearest(float dividend, float divisor)
 {
@@ -998,12 +1031,12 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
 
-#define FPU_ADD_S(a, b) ps2_fadd((float)(a), (float)(b))
-#define FPU_SUB_S(a, b) ps2_fsub((float)(a), (float)(b))
-#define FPU_MUL_S(a, b) ps2_fmul((float)(a), (float)(b))
-#define FPU_DIV_S(a, b) ps2_fdiv((float)(a), (float)(b))
+#define FPU_ADD_S(a, b) ps2FpuAdd((float)(a), (float)(b))
+#define FPU_SUB_S(a, b) ps2FpuSub((float)(a), (float)(b))
+#define FPU_MUL_S(a, b) ps2FpuClamp((float)(a) * (float)(b))
+#define FPU_DIV_S(a, b) ps2FpuClamp(ps2FpuDivideNearest((float)(a), (float)(b)))
 #define FPU_RSQRT_S(a, b) ps2_frsqrt((float)(a), (float)(b))
-#define FPU_SQRT_S(a) ps2_fsqrt((float)(a))
+#define FPU_SQRT_S(a) ps2FpuClamp(ps2FpuSqrtNearest(std::fabs((float)(a))))
 
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
