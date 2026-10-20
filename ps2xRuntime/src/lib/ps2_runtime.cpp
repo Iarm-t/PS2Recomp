@@ -2,6 +2,7 @@
 #include "ps2_runtime.h"
 #include "runtime/ps2_save_state.h"
 #include "runtime/ps2_display_options.h"
+#include "runtime/ps2_perf_overlay.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -2615,6 +2616,10 @@ void PS2Runtime::run()
     using PresentClock = std::chrono::steady_clock;
     const auto presentStart = PresentClock::now();
     auto lastSwap = presentStart;
+    auto lastPresent = presentStart;
+    uint64_t presentedSequence = 0u;
+    if (const char *overlay = std::getenv("PS2X_PERF_OVERLAY"); overlay && *overlay == '1')
+        ps2x::perfoverlay::setVisible(true);
     const bool tracingFrames = frameTimes.is_open() && frameTimes.good();
     std::vector<uint64_t> screenshotFields;
     if (const char *fields = std::getenv("PS2X_SCREENSHOT_FIELDS"))
@@ -2644,6 +2649,7 @@ void PS2Runtime::run()
                 break;
             }
             WaitTime(1.0 / 120.0);
+            lastPresent = PresentClock::now();
             continue;
         }
         PS2_IF_AGRESSIVE_LOGS({
@@ -2731,6 +2737,7 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
+        ps2x::perfoverlay::draw();
         {
             std::string stateText;
             float stateAlpha = 0.0f;
@@ -2756,6 +2763,13 @@ void PS2Runtime::run()
         }
         const auto swapStart = tracingFrames ? PresentClock::now() : presentStart;
         EndDrawing();
+        {
+            const auto presented = PresentClock::now();
+            presentedSequence = std::max(presentedSequence, sharedFrame.sequence);
+            ps2x::perfoverlay::recordPresent(std::chrono::duration<double>(presented - lastPresent).count(),
+                                             eeScheduler().currentVSyncTick(), shared, presentedSequence);
+            lastPresent = presented;
+        }
         if (tracingFrames)
         {
             const auto now = PresentClock::now();
@@ -2791,6 +2805,8 @@ void PS2Runtime::run()
         }
 #endif
         ps2_host_input::sample();
+        if (IsKeyPressed(KEY_F3))
+            ps2x::perfoverlay::toggle();
         if (IsKeyPressed(KEY_F5))
             ps2x::savestate::requestQuickSave();
         if (IsKeyPressed(KEY_F9))
