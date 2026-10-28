@@ -2325,6 +2325,16 @@ struct GSGpuBackend::Impl
 
     PresentationFrame presentAsync(uint32_t width, uint32_t height, uint32_t displayFbp)
     {
+        // Keep at most one presented frame queued on the GPU: wait for the previous present's fence. Without a bound
+        // the GS thread queues GPU work far ahead in heavy scenes, and the GPU then sits at 100% while presenting a
+        // fraction of the frames (riding in the open field: ~10 frames/s unpaced, ~45 paced).
+        Readback &previous = readbacks[(readbackNext + readbacks.size() - 1u) % readbacks.size()];
+        if (previous.fence)
+        {
+            const auto waitStart = std::chrono::steady_clock::now();
+            gl().ClientWaitSync(previous.fence, kSyncFlushCommandsBit, 250000000ull);
+            presentStats.wait += std::chrono::steady_clock::now() - waitStart;
+        }
         for (uint32_t i = 0; i < readbacks.size(); ++i)
             harvest(readbacks[(readbackNext + i) % readbacks.size()]);
         Readback &slot = readbacks[readbackNext];
