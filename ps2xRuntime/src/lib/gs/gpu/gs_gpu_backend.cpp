@@ -1058,6 +1058,20 @@ struct GSGpuBackend::Impl
                 }
                 GLint ok = 0;
                 gl().GetProgramiv(item.program, kLinkStatus, &ok);
+                std::string compileLog;
+                if (!ok)
+                {
+                    GLint compiled = 0;
+                    gl().GetShaderiv(item.fragment, kCompileStatus, &compiled);
+                    GLint length = 0;
+                    if (!compiled)
+                        gl().GetShaderiv(item.fragment, kInfoLogLength, &length);
+                    if (length > 0)
+                    {
+                        compileLog.assign(static_cast<size_t>(length), '\0');
+                        gl().GetShaderInfoLog(item.fragment, length, nullptr, compileLog.data());
+                    }
+                }
                 gl().DeleteShader(item.fragment);
                 if (ok)
                     storeHardwareBinary(item.job.cachePath, item.job.cacheKey, item.program);
@@ -1067,7 +1081,8 @@ struct GSGpuBackend::Impl
                     gl().GetProgramiv(item.program, kInfoLogLength, &length);
                     std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
                     gl().GetProgramInfoLog(item.program, length, nullptr, log.data());
-                    std::fprintf(stderr, "[gs-gpu] hardware raster variant failed; that state keeps the compute renderer:\n%s\n", log.c_str());
+                    std::fprintf(stderr, "[gs-gpu] hardware raster variant failed; that state keeps the compute renderer:\n%s\n%s\n",
+                                 log.c_str(), compileLog.c_str());
                     std::fflush(stderr);
                     gl().DeleteProgram(item.program);
                     item.program = 0;
