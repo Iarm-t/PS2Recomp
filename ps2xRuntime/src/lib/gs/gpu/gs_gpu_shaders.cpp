@@ -968,12 +968,25 @@ void main()
         for (uint k = 0u; k < count; ++k)
             if (coversPixel(tileList[tile.z + base + k], x, y))
                 mask |= 1u << k;
+#ifdef GL_KHR_shader_subgroup_arithmetic
+        // Walk the primitives any lane covers so the primitive index stays uniform across the subgroup: its
+        // primitive and state words then load once per wave instead of once per pixel. Per-pixel order is unchanged.
+        uint pending = subgroupOr(mask);
+        while (pending != 0u)
+        {
+            uint k = uint(findLSB(pending));
+            pending &= pending - 1u;
+            if ((mask & (1u << k)) != 0u)
+                drawPrim(tileList[tile.z + base + k], x, y);
+        }
+#else
         while (mask != 0u)
         {
             uint k = uint(findLSB(mask));
             mask &= mask - 1u;
             drawPrim(tileList[tile.z + base + k], x, y);
         }
+#endif
     }
 }
 )GLSL";

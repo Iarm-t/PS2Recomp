@@ -1293,7 +1293,7 @@ struct GSGpuBackend::Impl
             {"TABLE_P8", PixelStorageMode::P8}, {"TABLE_P4", PixelStorageMode::P4}};
         const uint32_t sizes[] = {65536u, 65536u, 131072u, 131072u, 131072u, 131072u, 262144u, 524288u};
         std::vector<uint16_t> swizzle;
-        std::string prefix = "#version 460 core\n";
+        std::string prefix = "#version 460 core\n#extension GL_KHR_shader_subgroup_arithmetic : enable\n";
         for (size_t i = 0; i < std::size(tables); ++i)
         {
             prefix += "#define " + std::string(tables[i].first) + " " + std::to_string(swizzle.size()) + "u\n";
