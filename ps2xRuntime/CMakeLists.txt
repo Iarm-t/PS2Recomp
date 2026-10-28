@@ -83,6 +83,47 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
+    # GLFW 3.4's waitForVisibilityNotify only spends its 0.1 s timeout while the X11 queue is empty, so when other
+    # events are pending and VisibilityNotify never comes, window creation spins forever. Bound it by wall time.
+    set(PS2X_GLFW_X11_WINDOW "${raylib_SOURCE_DIR}/src/external/glfw/src/x11_window.c")
+    if(EXISTS "${PS2X_GLFW_X11_WINDOW}")
+        file(READ "${PS2X_GLFW_X11_WINDOW}" PS2X_GLFW_SOURCE)
+        set(PS2X_GLFW_WAIT_OLD [=[
+    XEvent dummy;
+    double timeout = 0.1;
+
+    while (!XCheckTypedWindowEvent(_glfw.x11.display,
+                                   window->x11.handle,
+                                   VisibilityNotify,
+                                   &dummy))
+    {
+        if (!waitForX11Event(&timeout))
+            return GLFW_FALSE;
+    }
+]=])
+        set(PS2X_GLFW_WAIT_NEW [=[
+    XEvent dummy;
+    const uint64_t deadline = _glfwPlatformGetTimerValue() + _glfwPlatformGetTimerFrequency() / 10;
+
+    while (!XCheckTypedWindowEvent(_glfw.x11.display,
+                                   window->x11.handle,
+                                   VisibilityNotify,
+                                   &dummy))
+    {
+        const uint64_t now = _glfwPlatformGetTimerValue();
+        if (now >= deadline)
+            return GLFW_FALSE;
+        double timeout = (double) (deadline - now) / (double) _glfwPlatformGetTimerFrequency();
+        if (!waitForX11Event(&timeout))
+            return GLFW_FALSE;
+    }
+]=])
+        string(REPLACE "${PS2X_GLFW_WAIT_OLD}" "${PS2X_GLFW_WAIT_NEW}" PS2X_GLFW_PATCHED "${PS2X_GLFW_SOURCE}")
+        if(NOT PS2X_GLFW_PATCHED STREQUAL PS2X_GLFW_SOURCE)
+            file(WRITE "${PS2X_GLFW_X11_WINDOW}" "${PS2X_GLFW_PATCHED}")
+        endif()
+    endif()
+
     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
             imgui
