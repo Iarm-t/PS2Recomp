@@ -608,6 +608,10 @@ endif()
 
 if(WIN32)
     target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT PS2X_IS_ANDROID)
+    # The GPU GS backend creates its own surfaceless OpenGL contexts through EGL.
+    find_package(OpenGL REQUIRED COMPONENTS EGL)
+    target_link_libraries(ps2_runtime PUBLIC OpenGL::EGL)
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
