@@ -392,6 +392,102 @@ uint lookupClut(uint s, uint index)
     return 0xFFFF00FFu;
 }
 
+uvec4 lookupClut4(uint s, uvec4 index)
+{
+    uint mode = st(s, S_TEXMODE);
+    uint cpsm = (mode >> 16u) & 0xFFu;
+    uint csm = (mode >> 24u) & 0xFFu;
+    uint csa = st(s, S_CSA);
+    uint sourcePsm = st(s, S_TPSM);
+    uint version = st(s, S_CLUT);
+    bool sixteenBit = cpsm == 2u || cpsm == 10u;
+    uint csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
+    uint clutBase = (csa & csaMask) << 4u;
+    uvec4 sourceIndex = isFourBit(sourcePsm) ? (index & 0x0Fu) : index;
+    uvec4 clutIndex = (clutBase + sourceIndex) & (sixteenBit ? 0x1FFu : 0x0FFu);
+    if (!sixteenBit && csm == 0u && isEightBit(sourcePsm))
+    {
+        uvec4 block = min((sourceIndex & 0xF0u) + clutBase, uvec4(240u));
+        clutIndex = block + (sourceIndex & 0x0Fu);
+    }
+    uvec4 result = uvec4(0xFFFF00FFu);
+    if (cpsm == 0u || cpsm == 1u)
+    {
+        uvec4 lo = uvec4(clutEntry(version, clutIndex.x), clutEntry(version, clutIndex.y), clutEntry(version, clutIndex.z), clutEntry(version, clutIndex.w));
+        uvec4 hi = uvec4(clutEntry(version, clutIndex.x + 256u), clutEntry(version, clutIndex.y + 256u), clutEntry(version, clutIndex.z + 256u), clutEntry(version, clutIndex.w + 256u));
+        uvec4 color = lo | (hi << 16u);
+        if (cpsm == 1u)
+            color &= 0x00FFFFFFu;
+        result = uvec4(applyTexa(s, cpsm, color.x), applyTexa(s, cpsm, color.y), applyTexa(s, cpsm, color.z), applyTexa(s, cpsm, color.w));
+    }
+    else if (sixteenBit)
+    {
+        uvec4 c = uvec4(clutEntry(version, clutIndex.x), clutEntry(version, clutIndex.y), clutEntry(version, clutIndex.z), clutEntry(version, clutIndex.w));
+        result = uvec4(applyTexa(s, cpsm, rgba5551To8888(c.x)), applyTexa(s, cpsm, rgba5551To8888(c.y)),
+                       applyTexa(s, cpsm, rgba5551To8888(c.z)), applyTexa(s, cpsm, rgba5551To8888(c.w)));
+    }
+    return result;
+}
+
+// Converts raw texels to RGBA8888. Four at a time so the CLUT reads of a bilinear footprint are issued together.
+uvec4 decodeTexels(uint s, uint psm, uvec4 raw)
+{
+    switch (psm)
+    {
+    case 0x00u: case 0x30u: case 0x01u: case 0x31u:
+        return uvec4(applyTexa(s, psm, raw.x), applyTexa(s, psm, raw.y), applyTexa(s, psm, raw.z), applyTexa(s, psm, raw.w));
+    case 0x02u: case 0x0Au: case 0x32u: case 0x3Au:
+        return uvec4(applyTexa(s, psm, rgba5551To8888(raw.x)), applyTexa(s, psm, rgba5551To8888(raw.y)),
+                     applyTexa(s, psm, rgba5551To8888(raw.z)), applyTexa(s, psm, rgba5551To8888(raw.w)));
+    case 0x13u: case 0x1Bu: case 0x14u: case 0x24u: case 0x2Cu:
+        return lookupClut4(s, raw & 0xFFu);
+    }
+    return uvec4(0xFFFF00FFu);
+}
+
+// Fetches the four texels of a bilinear footprint. Each phase (wrap, swizzle lookup, VRAM read, CLUT read) runs for
+// all taps before the next, so the dependent memory reads of different taps overlap instead of running in series.
+uvec4 fetchTexels(uint s, ivec4 u, ivec4 v)
+{
+    uint size = st(s, S_TEXSIZE);
+    int texW = int(size & 0xFFFFu);
+    int texH = int(size >> 16u);
+    uint lo = st(s, S_CLAMP_LO);
+    uint hi = st(s, S_CLAMP_HI);
+    uint wrapU = lo & 3u;
+    uint wrapV = (lo >> 2u) & 3u;
+    uint minU = (lo >> 4u) & 0x3FFu;
+    uint maxU = (lo >> 14u) & 0x3FFu;
+    uint minV = (lo >> 24u) | ((hi & 0x3u) << 8u);
+    uint maxV = (hi >> 2u) & 0x3FFu;
+    uvec4 wu = uvec4(wrapCoordinate(u.x, texW, wrapU, minU, maxU), wrapCoordinate(u.y, texW, wrapU, minU, maxU),
+                     wrapCoordinate(u.z, texW, wrapU, minU, maxU), wrapCoordinate(u.w, texW, wrapU, minU, maxU));
+    uvec4 wv = uvec4(wrapCoordinate(v.x, texH, wrapV, minV, maxV), wrapCoordinate(v.y, texH, wrapV, minV, maxV),
+                     wrapCoordinate(v.z, texH, wrapV, minV, maxV), wrapCoordinate(v.w, texH, wrapV, minV, maxV));
+    uint psm = st(s, S_TPSM);
+    uvec4 raw = uvec4(0u);
+    uint f = fmtOf(psm);
+    if (FMT_KIND[f] != KIND_INVALID)
+    {
+        uint tbp = st(s, S_TBP0);
+        uint tbw = st(s, S_TBW);
+        uvec2 l0 = locate(f, tbp, tbw, wu.x, wv.x);
+        uvec2 l1 = locate(f, tbp, tbw, wu.y, wv.y);
+        uvec2 l2 = locate(f, tbp, tbw, wu.z, wv.z);
+        uvec2 l3 = locate(f, tbp, tbw, wu.w, wv.w);
+        uint epoch = st(s, S_EPOCH);
+        if (epoch < uRaster.x)
+        {
+            l0.x = (pageMap[epoch * 512u + (l0.x >> 13u)] << 13u) | (l0.x & 0x1FFFu);
+            l1.x = (pageMap[epoch * 512u + (l1.x >> 13u)] << 13u) | (l1.x & 0x1FFFu);
+            l2.x = (pageMap[epoch * 512u + (l2.x >> 13u)] << 13u) | (l2.x & 0x1FFFu);
+            l3.x = (pageMap[epoch * 512u + (l3.x >> 13u)] << 13u) | (l3.x & 0x1FFFu);
+        }
+        raw = uvec4(loadAt(f, l0), loadAt(f, l1), loadAt(f, l2), loadAt(f, l3));
+    }
+    return decodeTexels(s, psm, raw);
+}
+
 uint samplePoint(uint s, int u, int v)
 {
     uint size = st(s, S_TEXSIZE);
@@ -471,10 +567,11 @@ uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
     int v0 = int(floor(sampleV));
     precise float fx = sampleU - float(u0);
     precise float fy = sampleV - float(v0);
-    uint c00 = samplePoint(s, u0, v0);
-    uint c10 = samplePoint(s, u0 + 1, v0);
-    uint c01 = samplePoint(s, u0, v0 + 1);
-    uint c11 = samplePoint(s, u0 + 1, v0 + 1);
+    uvec4 taps = fetchTexels(s, ivec4(u0, u0 + 1, u0, u0 + 1), ivec4(v0, v0, v0 + 1, v0 + 1));
+    uint c00 = taps.x;
+    uint c10 = taps.y;
+    uint c01 = taps.z;
+    uint c11 = taps.w;
     uint r = lerpChannel(c00 & 0xFFu, c10 & 0xFFu, c01 & 0xFFu, c11 & 0xFFu, fx, fy);
     uint g = lerpChannel((c00 >> 8u) & 0xFFu, (c10 >> 8u) & 0xFFu, (c01 >> 8u) & 0xFFu, (c11 >> 8u) & 0xFFu, fx, fy);
     uint b = lerpChannel((c00 >> 16u) & 0xFFu, (c10 >> 16u) & 0xFFu, (c01 >> 16u) & 0xFFu, (c11 >> 16u) & 0xFFu, fx, fy);
