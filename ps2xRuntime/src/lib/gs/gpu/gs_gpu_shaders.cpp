@@ -541,6 +541,10 @@ float fabsQ(float q)
 
 uint sampleTexture(uint s, float ss, float tt, float q, uint u, uint v)
 {
+#ifdef GS_UNTEXTURED
+    // Variant for dispatches with no textured primitive: without the sampling code the shader is much lighter.
+    return 0u;
+#endif
     uint size = st(s, S_TEXSIZE);
     float texW = float(size & 0xFFFFu);
     float texH = float(size >> 16u);

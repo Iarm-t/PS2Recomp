@@ -231,6 +231,7 @@ struct GSGpuBackend::Impl
     std::array<GLsync, kRingChunks> ringFences{};
 
     Program raster;
+    Program rasterUntextured;
     Program clutLoad;
     Program upload;
     Program copyRead;
@@ -551,7 +552,7 @@ struct GSGpuBackend::Impl
                     gl.DeleteQueries(1, &query);
             const GLuint buffers[] = {vramBuffer, swizzleBuffer, clutBuffer, primBuffer, stateBuffer, tileBuffer, tileListBuffer, dataBuffer, clutOpBuffer, pageMapBuffer};
             gl.DeleteBuffers(static_cast<GLsizei>(std::size(buffers)), buffers);
-            for (Program *program : {&raster, &clutLoad, &upload, &copyRead, &copyWrite, &clear, &poke, &present, &presentHash, &pageCopy, &hwRaster})
+            for (Program *program : {&raster, &rasterUntextured, &clutLoad, &upload, &copyRead, &copyWrite, &clear, &poke, &present, &presentHash, &pageCopy, &hwRaster})
                 if (program->id)
                     gl.DeleteProgram(program->id);
             if (hwFramebuffer)
@@ -1323,6 +1324,7 @@ struct GSGpuBackend::Impl
                                                           kMapWriteBit | kMapPersistentBit | kMapCoherentBit));
 
         const bool ok = compile(raster, prefix, GSGpuShaders::kRaster, {"uRaster"}) &&
+                        compile(rasterUntextured, prefix + "#define GS_UNTEXTURED 1\n", GSGpuShaders::kRaster, {"uRaster"}) &&
                         compile(pageCopy, prefix, GSGpuShaders::kPageCopy, {}) &&
                         compile(clutLoad, prefix, GSGpuShaders::kClutLoad, {"uClutA", "uClutB"}) &&
                         compile(upload, prefix, GSGpuShaders::kUpload, {"uUpload"}) &&
@@ -1644,8 +1646,12 @@ struct GSGpuBackend::Impl
             bindUpload(4u, stateBuffer, states.data(), states.size() * sizeof(uint32_t));
             bindUpload(5u, tileBuffer, tileHeaders.data(), tileHeaders.size() * sizeof(uint32_t));
             bindUpload(6u, tileListBuffer, tileList.data(), tileList.size() * sizeof(uint32_t));
-            g.UseProgram(raster.id);
-            g.Uniform4ui(raster.loc[0], epoch, 0u, 0u, 0u);
+            bool textured = false;
+            for (uint32_t prim = 0u; prim < primCount && !textured; ++prim)
+                textured = (states[static_cast<size_t>(prims[static_cast<size_t>(prim) * kPrimWords] >> 8u) * kStateWords + SFlags] & FTme) != 0u;
+            const Program &program = textured ? raster : rasterUntextured;
+            g.UseProgram(program.id);
+            g.Uniform4ui(program.loc[0], epoch, 0u, 0u, 0u);
             const GLuint profRaster = profBegin();
             g.DispatchCompute(static_cast<GLuint>(touched.size()), 1u, 1u);
             profEnd(0u, profRaster);
