@@ -1221,6 +1221,23 @@ struct GSGpuBackend::Impl
             return false;
         body += shading;
         hwFragmentHead = version + "#extension GL_ARB_fragment_shader_interlock : require\n";
+        {
+            // Ordered pixel writes need fragment shader interlock; drivers without it (Mesa radeonsi) keep the compute renderer.
+            const std::string probe = hwFragmentHead + "layout(pixel_interlock_ordered) in;\nvoid main() { beginInvocationInterlockARB(); endInvocationInterlockARB(); }\n";
+            const char *text = probe.c_str();
+            const GLuint shader = gl().CreateShader(kFragmentShader);
+            gl().ShaderSource(shader, 1, &text, nullptr);
+            gl().CompileShader(shader);
+            GLint ok = 0;
+            gl().GetShaderiv(shader, kCompileStatus, &ok);
+            gl().DeleteShader(shader);
+            if (!ok)
+            {
+                std::fprintf(stderr, "[gs-gpu] GL_ARB_fragment_shader_interlock unavailable; using the compute renderer\n");
+                std::fflush(stderr);
+                return false;
+            }
+        }
         std::string common = GSGpuShaders::kCommon;
         const std::string vramDeclaration = "layout(std430, binding = 0) buffer VramBuffer";
         if (common.find(vramDeclaration) == std::string::npos)
