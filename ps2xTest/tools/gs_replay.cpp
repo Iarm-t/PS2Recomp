@@ -681,6 +681,10 @@ int main(int argc, char **argv)
 
     if (doSample)
     {
+#ifndef _WIN32
+        std::cerr << "--sample needs the Win32 sampler\n";
+        return 2;
+#else
         GSSampler sampler;
         sampler.Start();
         for (int run = 0; run < repeat; ++run)
@@ -690,6 +694,7 @@ int main(int argc, char **argv)
         }
         sampler.StopAndReport(40);
         return 0;
+#endif
     }
 
     int status = 0;
