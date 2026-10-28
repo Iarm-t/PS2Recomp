@@ -614,6 +614,38 @@ int pickRgb(uint sel, int cs, int cd)
 }
 
 )GLSL" R"GLSL(
+// Each invocation owns one pixel, so the swizzled frame and depth addresses only change when a primitive targets a
+// different buffer. They are kept here and reused by every later primitive that covers the pixel.
+uvec4 gTargetKey[2] = uvec4[2](uvec4(0xFFFFFFFFu), uvec4(0xFFFFFFFFu));
+uvec2 gTargetLoc[2];
+
+uvec2 targetLocation(uint slot, uint f, uint base, uint bw, uint x, uint y)
+{
+    uvec4 key = uvec4(f, base, bw, (y << 16u) | x);
+    if (gTargetKey[slot] != key)
+    {
+        gTargetKey[slot] = key;
+        gTargetLoc[slot] = locate(f, base, bw, x, y);
+    }
+    return gTargetLoc[slot];
+}
+
+uint readTarget(uint slot, uint psm, uint base, uint bw, uint x, uint y)
+{
+    uint f = fmtOf(psm);
+    if (FMT_KIND[f] == KIND_INVALID)
+        return 0u;
+    return loadAt(f, targetLocation(slot, f, base, bw, x, y));
+}
+
+void writeTarget(uint slot, uint psm, uint base, uint bw, uint x, uint y, uint value)
+{
+    uint f = fmtOf(psm);
+    if (FMT_KIND[f] == KIND_INVALID)
+        return;
+    storeAt(f, targetLocation(slot, f, base, bw, x, y), value);
+}
+
 void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
 {
     uint sx = st(s, S_SCISSOR_X);
@@ -660,7 +692,7 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
     uint fbrgba = 0u;
     if (frmw)
     {
-        raw = readPixel(fpsm, fbp, fbw, uint(x), uint(y));
+        raw = readTarget(0u, fpsm, fbp, fbw, uint(x), uint(y));
         fbrgba = raw;
         if (bitsPerPixel(fpsm) == 16u)
             fbrgba = rgba5551To8888(fbrgba);
@@ -674,9 +706,9 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
     if (ztestMethod == 1u)
         zpass = true;
     else if (ztestMethod == 2u)
-        zpass = z >= readPixel(zpsm, zbp, fbw, uint(x), uint(y));
+        zpass = z >= readTarget(1u, zpsm, zbp, fbw, uint(x), uint(y));
     else if (ztestMethod == 3u)
-        zpass = z > readPixel(zpsm, zbp, fbw, uint(x), uint(y));
+        zpass = z > readTarget(1u, zpsm, zbp, fbw, uint(x), uint(y));
     if (!zpass)
         return;
 
@@ -720,10 +752,10 @@ void writePixel(uint s, int x, int y, uint z, uvec4 c, uint fog)
             pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
         if (bitsPerPixel(fpsm) == 16u)
             pixel = rgba8888To5551(pixel);
-        writePixelRaw(fpsm, fbp, fbw, uint(x), uint(y), pixel);
+        writeTarget(0u, fpsm, fbp, fbw, uint(x), uint(y), pixel);
     }
     if (writeDepth && st(s, S_ZMASK) == 0u)
-        writePixelRaw(zpsm, zbp, fbw, uint(x), uint(y), z);
+        writeTarget(1u, zpsm, zbp, fbw, uint(x), uint(y), z);
 }
 
 uvec4 unpackColor(uint c)
